@@ -19,7 +19,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install paddle2onnx onnx onnxsim
-          pip install paddlepaddle==2.6.1
+          pip install paddlepaddle==2.6.2
 
       - name: Run conversion script
         run: python tools/convert_humanseg.py
