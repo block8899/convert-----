@@ -47,8 +47,6 @@ def export_onnx(repo_dir):
     export_script = os.path.join(WORK_DIR, "export_onnx.py")
     with open(export_script, "w") as f:
         f.write('''
-import sys
-sys.path.insert(0, "PaddleSeg")
 
 import paddle
 from paddleseg.models import PPMobileSeg
