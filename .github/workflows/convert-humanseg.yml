@@ -20,7 +20,7 @@ jobs:
         run: |
           pip install numpy==1.26.4
           pip install opencv-python==4.8.0.74
-          pip install paddlepaddle==2.6.2
+          pip install paddlepaddle==3.1.1
           pip install paddle2onnx onnx onnxsim paddleseg
           
       - name: Run conversion script
