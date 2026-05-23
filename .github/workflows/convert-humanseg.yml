@@ -1,4 +1,4 @@
-name: Convert PP-HumanSegV2 to NCNN
+name: Convert Person Seg to NCNN
 
 on:
   workflow_dispatch:
@@ -8,8 +8,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -18,15 +16,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install numpy==1.26.4
-          pip install opencv-python==4.8.0.74
-          pip install paddlepaddle==3.1.1
-          pip install paddle2onnx onnx onnxsim paddleseg
-          
-      - name: Run conversion script
+          pip install onnx onnxsim
+
+      - name: Run conversion
         run: python tools/convert_humanseg.py
 
-      - name: Upload NCNN model
+      - name: Upload model
         uses: actions/upload-artifact@v4
         with:
           name: humansegv2-ncnn
