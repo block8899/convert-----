@@ -1,4 +1,4 @@
-name: Convert PP-HumanSegV2 to NCNN
+name: Convert Seg Model to NCNN
 
 on:
   workflow_dispatch:
@@ -16,8 +16,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install numpy==1.26.4
-          pip install opencv-python==4.8.0.74
           pip install onnx onnxsim
 
       - name: Run conversion
