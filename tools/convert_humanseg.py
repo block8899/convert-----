@@ -1,221 +1,386 @@
 """
-Segmentation ONNX → NCNN via PNNX
-Approach: Download ONNX → load bằng onnxruntime → export PyTorch → PNNX → NCNN
+U2Net Portrait Segmentation → NCNN via PNNX
+Approach: PyTorch pretrained → PNNX → NCNN (giống DnCNN)
 """
 
+import torch
+import torch.nn as nn
+import pnnx
 import os
 import sys
-import shutil
+import gc
 import urllib.request
-import numpy as np
 
 WORK_DIR = "convert_tmp"
 OUTPUT_DIR = "output"
 
-MODEL_SOURCES = [
-    {
-        "name": "U2Net salient (HuggingFace)",
-        "url": "https://huggingface.co/lllyasviel/Annotators/resolve/main/u2net.onnx",
-    },
-    {
-        "name": "RMBG-1.4 (HuggingFace)",
-        "url": "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model.onnx",
-    },
-]
+# ═══════════════════════════════════════════════════
+# U2-Net Architecture (full)
+# Source: https://github.com/xuebinqin/U-2-Net
+# ═══════════════════════════════════════════════════
+
+class REBNCONV(nn.Module):
+    def __init__(self, in_ch=3, out_ch=3, dirate=1):
+        super().__init__()
+        self.conv_s1 = nn.Conv2d(in_ch, out_ch, 3, padding=1*dirate, dilation=1*dirate)
+        self.bn_s1 = nn.BatchNorm2d(out_ch)
+        self.relu_s1 = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.relu_s1(self.bn_s1(self.conv_s1(x)))
 
 
-def download_model():
-    os.makedirs(WORK_DIR, exist_ok=True)
-    onnx_path = os.path.join(WORK_DIR, "model.onnx")
+class RSU7(nn.Module):
+    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
+        super().__init__()
+        self.rebnconvin = REBNCONV(in_ch, out_ch, dirate=1)
+        self.rebnconv1 = REBNCONV(out_ch, mid_ch, dirate=1)
+        self.pool1 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv2 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.pool2 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv3 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.pool3 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv4 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.pool4 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv5 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.pool5 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv6 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.rebnconv7 = REBNCONV(mid_ch, mid_ch, dirate=2)
+        self.rebnconv6d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv5d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv4d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv3d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv2d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv1d = REBNCONV(mid_ch*2, out_ch, dirate=1)
 
-    print("[1/5] Downloading segmentation ONNX model...")
+    def _upsample(self, x, size):
+        return nn.functional.interpolate(x, size=size, mode='bilinear', align_corners=True)
 
-    for source in MODEL_SOURCES:
-        try:
-            print(f"    Trying: {source['name']}...")
-            req = urllib.request.Request(
-                source["url"],
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
-            with urllib.request.urlopen(req, timeout=180) as response:
-                with open(onnx_path, "wb") as f:
-                    shutil.copyfileobj(response, f)
-
-            size_mb = os.path.getsize(onnx_path) / 1024 / 1024
-            print(f"    OK! ({size_mb:.1f} MB)")
-            return onnx_path
-
-        except Exception as e:
-            print(f"    Failed: {e}")
-            continue
-
-    raise RuntimeError("All model sources failed")
-
-
-def convert_onnx_to_torch(onnx_path):
-    """Load ONNX model, export weights as PyTorch model via onnx2torch"""
-    print("[2/5] Converting ONNX → PyTorch...")
-
-    try:
-        # onnx2torch: convert ONNX model trực tiếp sang PyTorch
-        from onnx2torch import convert
-        torch_model = convert(onnx_path)
-        torch_model.eval()
-        print("    onnx2torch OK!")
-        return torch_model
-    except Exception as e:
-        print(f"    onnx2torch failed: {e}")
-        print("    Trying alternative approach...")
-        return None
-
-
-def convert_via_onnx_surgery(onnx_path):
-    """
-    Alternative: Load ONNX → trace qua PyTorch
-    Dùng onnxruntime chạy inference, rồi build PyTorch wrapper
-    """
-    print("[2b/5] Alternative: PyTorch wrapper approach...")
-
-    import torch
-    import torch.nn as nn
-    import onnxruntime as ort
-
-    # Get model info
-    sess = ort.InferenceSession(onnx_path)
-    input_info = sess.get_inputs()[0]
-    input_name = input_info.name
-    input_shape = input_info.shape
-
-    # Resolve dynamic dims
-    resolved_shape = []
-    for d in input_shape:
-        if isinstance(d, str) or d <= 0:
-            resolved_shape.append(1)
-        else:
-            resolved_shape.append(d)
-
-    print(f"    Input: {input_name} shape={resolved_shape}")
-
-    # Create simple PyTorch wrapper
-    class OnnxWrapper(nn.Module):
-        def __init__(self, onnx_path, input_name, output_name):
-            super().__init__()
-            self.onnx_path = onnx_path
-            self.input_name = input_name
-            self.output_name = output_name
-            self._sess = None
-
-        def forward(self, x):
-            if self._sess is None:
-                self._sess = ort.InferenceSession(self.onnx_path)
-            inp = {self.input_name: x.numpy()}
-            out = self._sess.run([self.output_name], inp)
-            return torch.from_numpy(out[0])
-
-    output_name = sess.get_outputs()[0].name
-    wrapper = OnnxWrapper(onnx_path, input_name, output_name)
-    wrapper.eval()
-    print(f"    Wrapper created (input={input_name}, output={output_name})")
-    return wrapper, resolved_shape
+    def forward(self, x):
+        hx = x
+        hxin = self.rebnconvin(hx)
+        hx1 = self.rebnconv1(hxin)
+        hx = self.pool1(hx1)
+        hx2 = self.rebnconv2(hx)
+        hx = self.pool2(hx2)
+        hx3 = self.rebnconv3(hx)
+        hx = self.pool3(hx3)
+        hx4 = self.rebnconv4(hx)
+        hx = self.pool4(hx4)
+        hx5 = self.rebnconv5(hx)
+        hx = self.pool5(hx5)
+        hx6 = self.rebnconv6(hx)
+        hx7 = self.rebnconv7(hx6)
+        hx6d = self.rebnconv6d(torch.cat((hx7, hx6), 1))
+        hx5d = self.rebnconv5d(torch.cat((self._upsample(hx6d, hx5.shape[2:]), hx5), 1))
+        hx4d = self.rebnconv4d(torch.cat((self._upsample(hx5d, hx4.shape[2:]), hx4), 1))
+        hx3d = self.rebnconv3d(torch.cat((self._upsample(hx4d, hx3.shape[2:]), hx3), 1))
+        hx2d = self.rebnconv2d(torch.cat((self._upsample(hx3d, hx2.shape[2:]), hx2), 1))
+        hx1d = self.rebnconv1d(torch.cat((self._upsample(hx2d, hx1.shape[2:]), hx1), 1))
+        return hx1d + hxin
 
 
-def convert_to_ncnn(torch_model, input_shape):
-    """Export PyTorch model → NCNN via PNNX"""
-    import torch
-    import pnnx
+class RSU6(nn.Module):
+    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
+        super().__init__()
+        self.rebnconvin = REBNCONV(in_ch, out_ch, dirate=1)
+        self.rebnconv1 = REBNCONV(out_ch, mid_ch, dirate=1)
+        self.pool1 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv2 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.pool2 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv3 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.pool3 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv4 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.pool4 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv5 = REBNCONV(mid_ch, mid_ch, dirate=2)
+        self.rebnconv5d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv4d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv3d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv2d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv1d = REBNCONV(mid_ch*2, out_ch, dirate=1)
 
-    print("[3/5] Converting PyTorch → NCNN via PNNX...")
+    def _upsample(self, x, size):
+        return nn.functional.interpolate(x, size=size, mode='bilinear', align_corners=True)
 
-    dummy = torch.randn(*input_shape)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    pnnx.export(torch_model, "seg", inputs=dummy)
-    print("    PNNX export done!")
-
-    # Move output files
-    for ext in [".ncnn.param", ".ncnn.bin"]:
-        src = f"seg{ext}"
-        dst = os.path.join(OUTPUT_DIR, f"humansegv2{ext}")
-        if os.path.exists(src):
-            shutil.move(src, dst)
-            print(f"    {dst} ({os.path.getsize(dst):,} bytes)")
-
-    # Cleanup
-    for f in os.listdir("."):
-        if f.startswith("seg.") and f.endswith((".param", ".bin", ".py")):
-            os.remove(f)
-
-    return True
+    def forward(self, x):
+        hx = x
+        hxin = self.rebnconvin(hx)
+        hx1 = self.rebnconv1(hxin)
+        hx = self.pool1(hx1)
+        hx2 = self.rebnconv2(hx)
+        hx = self.pool2(hx2)
+        hx3 = self.rebnconv3(hx)
+        hx = self.pool3(hx3)
+        hx4 = self.rebnconv4(hx)
+        hx = self.pool4(hx4)
+        hx5 = self.rebnconv5(hx)
+        hx4d = self.rebnconv4d(torch.cat((self._upsample(hx5, hx4.shape[2:]), hx4), 1))
+        hx3d = self.rebnconv3d(torch.cat((self._upsample(hx4d, hx3.shape[2:]), hx3), 1))
+        hx2d = self.rebnconv2d(torch.cat((self._upsample(hx3d, hx2.shape[2:]), hx2), 1))
+        hx1d = self.rebnconv1d(torch.cat((self._upsample(hx2d, hx1.shape[2:]), hx1), 1))
+        return hx1d + hxin
 
 
-def verify():
-    print("[4/5] Verifying...")
-    param = os.path.join(OUTPUT_DIR, "humansegv2.ncnn.param")
-    binf = os.path.join(OUTPUT_DIR, "humansegv2.ncnn.bin")
+class RSU5(nn.Module):
+    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
+        super().__init__()
+        self.rebnconvin = REBNCONV(in_ch, out_ch, dirate=1)
+        self.rebnconv1 = REBNCONV(out_ch, mid_ch, dirate=1)
+        self.pool1 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv2 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.pool2 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv3 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.pool3 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv4 = REBNCONV(mid_ch, mid_ch, dirate=2)
+        self.rebnconv4d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv3d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv2d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv1d = REBNCONV(mid_ch*2, out_ch, dirate=1)
 
-    if os.path.exists(param) and os.path.exists(binf):
-        ps = os.path.getsize(param) / 1024
-        bs = os.path.getsize(binf) / 1024
-        print(f"    humansegv2.ncnn.param: {ps:.1f} KB")
-        print(f"    humansegv2.ncnn.bin:   {bs:.1f} KB")
-        print(f"    Total: {(ps + bs) / 1024:.1f} MB")
+    def _upsample(self, x, size):
+        return nn.functional.interpolate(x, size=size, mode='bilinear', align_corners=True)
 
-        with open(param, "r") as f:
-            content = f.read()
-            if "Input" in content:
-                print("    Param file OK")
-            else:
-                print("    WARNING: no Input layer found")
+    def forward(self, x):
+        hx = x
+        hxin = self.rebnconvin(hx)
+        hx1 = self.rebnconv1(hxin)
+        hx = self.pool1(hx1)
+        hx2 = self.rebnconv2(hx)
+        hx = self.pool2(hx2)
+        hx3 = self.rebnconv3(hx)
+        hx = self.pool3(hx3)
+        hx4 = self.rebnconv4(hx)
+        hx3d = self.rebnconv3d(torch.cat((self._upsample(hx4, hx3.shape[2:]), hx3), 1))
+        hx2d = self.rebnconv2d(torch.cat((self._upsample(hx3d, hx2.shape[2:]), hx2), 1))
+        hx1d = self.rebnconv1d(torch.cat((self._upsample(hx2d, hx1.shape[2:]), hx1), 1))
+        return hx1d + hxin
 
-        return True
+
+class RSU4(nn.Module):
+    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
+        super().__init__()
+        self.rebnconvin = REBNCONV(in_ch, out_ch, dirate=1)
+        self.rebnconv1 = REBNCONV(out_ch, mid_ch, dirate=1)
+        self.pool1 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv2 = REBNCONV(mid_ch, mid_ch, dirate=1)
+        self.pool2 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.rebnconv3 = REBNCONV(mid_ch, mid_ch, dirate=2)
+        self.rebnconv3d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv2d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv1d = REBNCONV(mid_ch*2, out_ch, dirate=1)
+
+    def _upsample(self, x, size):
+        return nn.functional.interpolate(x, size=size, mode='bilinear', align_corners=True)
+
+    def forward(self, x):
+        hx = x
+        hxin = self.rebnconvin(hx)
+        hx1 = self.rebnconv1(hxin)
+        hx = self.pool1(hx1)
+        hx2 = self.rebnconv2(hx)
+        hx = self.pool2(hx2)
+        hx3 = self.rebnconv3(hx)
+        hx2d = self.rebnconv2d(torch.cat((self._upsample(hx3, hx2.shape[2:]), hx2), 1))
+        hx1d = self.rebnconv1d(torch.cat((self._upsample(hx2d, hx1.shape[2:]), hx1), 1))
+        return hx1d + hxin
+
+
+class RSU4F(nn.Module):
+    def __init__(self, in_ch=3, mid_ch=12, out_ch=3):
+        super().__init__()
+        self.rebnconvin = REBNCONV(in_ch, out_ch, dirate=1)
+        self.rebnconv1 = REBNCONV(out_ch, mid_ch, dirate=1)
+        self.rebnconv2 = REBNCONV(mid_ch, mid_ch, dirate=2)
+        self.rebnconv3 = REBNCONV(mid_ch, mid_ch, dirate=4)
+        self.rebnconv4 = REBNCONV(mid_ch, mid_ch, dirate=8)
+        self.rebnconv4d = REBNCONV(mid_ch*2, mid_ch, dirate=4)
+        self.rebnconv3d = REBNCONV(mid_ch*2, mid_ch, dirate=2)
+        self.rebnconv2d = REBNCONV(mid_ch*2, mid_ch, dirate=1)
+        self.rebnconv1d = REBNCONV(mid_ch*2, out_ch, dirate=1)
+
+    def forward(self, x):
+        hx = x
+        hxin = self.rebnconvin(hx)
+        hx1 = self.rebnconv1(hxin)
+        hx2 = self.rebnconv2(hx1)
+        hx3 = self.rebnconv3(hx2)
+        hx4 = self.rebnconv4(hx3)
+        hx4d = self.rebnconv4d(torch.cat((hx4, hx3), 1))
+        hx3d = self.rebnconv3d(torch.cat((hx4d, hx2), 1))
+        hx2d = self.rebnconv2d(torch.cat((hx3d, hx1), 1))
+        hx1d = self.rebnconv1d(torch.cat((hx2d, hxin), 1))
+        return hx1d + hxin
+
+
+class U2NET(nn.Module):
+    def __init__(self, in_ch=3, out_ch=1):
+        super().__init__()
+        self.stage1 = RSU7(in_ch, 32, 64)
+        self.pool12 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.stage2 = RSU6(64, 32, 128)
+        self.pool23 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.stage3 = RSU5(128, 64, 256)
+        self.pool34 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.stage4 = RSU4(256, 128, 512)
+        self.pool45 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.stage5 = RSU4F(512, 256, 512)
+        self.pool56 = nn.MaxPool2d(2, stride=2, ceil_mode=True)
+        self.stage6 = RSU4F(512, 256, 512)
+        self.stage5d = RSU4F(1024, 256, 512)
+        self.stage4d = RSU4(1024, 128, 256)
+        self.stage3d = RSU5(512, 64, 128)
+        self.stage2d = RSU6(256, 32, 64)
+        self.stage1d = RSU7(128, 16, 64)
+        self.side1 = nn.Conv2d(64, out_ch, 3, padding=1)
+        self.side2 = nn.Conv2d(64, out_ch, 3, padding=1)
+        self.side3 = nn.Conv2d(128, out_ch, 3, padding=1)
+        self.side4 = nn.Conv2d(256, out_ch, 3, padding=1)
+        self.side5 = nn.Conv2d(512, out_ch, 3, padding=1)
+        self.side6 = nn.Conv2d(512, out_ch, 3, padding=1)
+        self.outconv = nn.Conv2d(6*out_ch, out_ch, 1)
+
+    def _upsample(self, x, size):
+        return nn.functional.interpolate(x, size=size, mode='bilinear', align_corners=True)
+
+    def forward(self, x):
+        hx = x
+        hx1 = self.stage1(hx)
+        hx = self.pool12(hx1)
+        hx2 = self.stage2(hx)
+        hx = self.pool23(hx2)
+        hx3 = self.stage3(hx)
+        hx = self.pool34(hx3)
+        hx4 = self.stage4(hx)
+        hx = self.pool45(hx4)
+        hx5 = self.stage5(hx)
+        hx = self.pool56(hx5)
+        hx6 = self.stage6(hx)
+        hx5d = self.stage5d(torch.cat((self._upsample(hx6, hx5.shape[2:]), hx5), 1))
+        hx4d = self.stage4d(torch.cat((self._upsample(hx5d, hx4.shape[2:]), hx4), 1))
+        hx3d = self.stage3d(torch.cat((self._upsample(hx4d, hx3.shape[2:]), hx3), 1))
+        hx2d = self.stage2d(torch.cat((self._upsample(hx3d, hx2.shape[2:]), hx2), 1))
+        hx1d = self.stage1d(torch.cat((self._upsample(hx2d, hx1.shape[2:]), hx1), 1))
+
+        d1 = self.side1(hx1d)
+        d2 = self._upsample(self.side2(hx2d), d1.shape[2:])
+        d3 = self._upsample(self.side3(hx3d), d1.shape[2:])
+        d4 = self._upsample(self.side4(hx4d), d1.shape[2:])
+        d5 = self._upsample(self.side5(hx5d), d1.shape[2:])
+        d6 = self._upsample(self.side6(hx6), d1.shape[2:])
+
+        d0 = self.outconv(torch.cat((d1, d2, d3, d4, d5, d6), 1))
+        return torch.sigmoid(d0)
+
+
+# ═══════════════════════════════════════════════════
+# Main — identical pattern to DnCNN converter
+# ═══════════════════════════════════════════════════
+
+WEIGHT_URL = "https://github.com/xuebinqin/U-2-Net/raw/master/saved_models/u2net/u2net.pth"
+WEIGHT_PATH = "u2net.pth"
+
+print("=" * 50)
+print("U2Net Portrait → NCNN Converter")
+print("=" * 50)
+
+print("1. Creating U2NET model...")
+model = U2NET(in_ch=3, out_ch=1)
+model.eval()
+torch.set_grad_enabled(False)
+
+params = sum(p.numel() for p in model.parameters())
+print(f"   Parameters: {params:,}")
+
+print("2. Downloading pretrained weights...")
+if not os.path.exists(WEIGHT_PATH):
+    print("   Downloading...")
+    req = urllib.request.Request(WEIGHT_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=300) as response:
+        with open(WEIGHT_PATH, "wb") as f:
+            shutil.copyfileobj(response, f)
+    print(f"   Done: {os.path.getsize(WEIGHT_PATH)/1024/1024:.1f} MB")
+else:
+    print(f"   Already exists: {os.path.getsize(WEIGHT_PATH)/1024/1024:.1f} MB")
+
+print("   Loading weights...")
+ckpt = torch.load(WEIGHT_PATH, map_location="cpu", weights_only=False)
+
+if isinstance(ckpt, dict):
+    if 'params' in ckpt:
+        state_dict = ckpt['params']
+    elif 'state_dict' in ckpt:
+        state_dict = ckpt['state_dict']
+    elif 'model_state_dict' in ckpt:
+        state_dict = ckpt['model_state_dict']
     else:
-        print(f"    FAILED! Files: {os.listdir(OUTPUT_DIR)}")
-        return False
+        state_dict = ckpt
+else:
+    state_dict = ckpt
 
+# Handle 'module.' prefix
+new_state_dict = {}
+for k, v in state_dict.items():
+    name = k.replace('module.', '')
+    new_state_dict[name] = v
 
-def main():
-    print("=" * 50)
-    print("Segmentation ONNX → NCNN (via PNNX)")
-    print("=" * 50)
+model.load_state_dict(new_state_dict, strict=True)
+print("   Weights loaded OK!")
 
-    os.makedirs(WORK_DIR, exist_ok=True)
+print("3. Converting to NCNN via PNNX...")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Step 1: Download ONNX
-    onnx_path = download_model()
+# Dùng input size nhỏ hơn để convert nhanh, PNNX sẽ handle dynamic size
+dummy = torch.randn(1, 3, 192, 192)
 
-    # Step 2: Try onnx2torch first
-    torch_model = convert_onnx_to_torch(onnx_path)
+try:
+    pnnx.export(model, "u2net", inputs=dummy)
+    print("   Done!")
+except Exception as e:
+    print(f"   PNNX failed: {e}")
+    sys.exit(1)
 
-    if torch_model is not None:
-        # Determine input shape
-        import onnx
-        model = onnx.load(onnx_path)
-        shape = [d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim]
-        input_shape = [1 if (isinstance(s, str) or s <= 0) else s for s in shape]
-        if len(input_shape) != 4:
-            input_shape = [1, 3, 192, 192]
-    else:
-        # Fallback: wrapper approach
-        torch_model, input_shape = convert_via_onnx_surgery(onnx_path)
+del model, dummy
+gc.collect()
 
-    print(f"    Input shape: {input_shape}")
+print("4. Verifying + renaming...")
+pf = "u2net.ncnn.param"
+bf = "u2net.ncnn.bin"
 
-    # Step 3: PNNX → NCNN
-    convert_to_ncnn(torch_model, input_shape)
+if os.path.exists(pf) and os.path.exists(bf):
+    sp = os.path.getsize(pf) / 1024
+    sb = os.path.getsize(bf) / 1024
+    print(f"   {pf}: {sp:.1f} KB")
+    print(f"   {bf}: {sb:.1f} KB")
+    print(f"   Total: {(sp + sb) / 1024:.1f} MB")
 
-    # Step 4: Verify
-    ok = verify()
+    # Rename to output
+    dst_p = os.path.join(OUTPUT_DIR, "humansegv2.ncnn.param")
+    dst_b = os.path.join(OUTPUT_DIR, "humansegv2.ncnn.bin")
+    shutil.move(pf, dst_p)
+    shutil.move(bf, dst_b)
 
-    print("=" * 50)
-    if ok:
-        print("DONE!")
-    else:
-        print("FAILED!")
-        sys.exit(1)
-    print("=" * 50)
+    # Verify param content
+    with open(dst_p, "r") as f:
+        content = f.read()
+        if "Input" in content:
+            print("   Param has Input layer ✓")
+        # Find output blob
+        for line in reversed(content.strip().split('\n')):
+            line = line.strip()
+            if line and not line.startswith('#') and not line.startswith("7767517"):
+                parts = line.split()
+                if len(parts) >= 4:
+                    print(f"   Output blob: {parts[-1]}")
+                    break
 
-    shutil.rmtree(WORK_DIR, ignore_errors=True)
+    print("U2NET → NCNN OK!")
+else:
+    print("FAILED!")
+    print(f"Files: {os.listdir('.')}")
+    sys.exit(1)
 
-
-if __name__ == "__main__":
-    main()
+print("=" * 50)
+print("DONE!")
+print(f"  {dst_p}")
+print(f"  {dst_b}")
+print("=" * 50)
