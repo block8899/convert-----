@@ -27,9 +27,33 @@ def export_to_onnx():
     import paddle
     from paddleseg.models import PPMobileSeg
 
-    # Dùng đúng params: ['self', 'num_classes', 'backbone', 'head_use_dw', 'align_corners', 'pretrained', 'upsample']
+    # Try different backbone options
+    backbone = None
+    for backbone_name in ["STDC2", "STDC1", "stdc2", "stdc1"]:
+        try:
+            from paddleseg.models import backbones
+            backbone_class = getattr(backbones, backbone_name, None)
+            if backbone_class is None:
+                # Try lowercase
+                backbone_class = getattr(backbones, backbone_name.lower(), None)
+            if backbone_class is not None:
+                backbone = backbone_class()
+                print(f"    Using backbone: {backbone_name}")
+                break
+        except Exception as e:
+            print(f"    Backbone {backbone_name} failed: {e}")
+            continue
+
+    if backbone is None:
+        # List available backbones
+        from paddleseg.models import backbones
+        available = [x for x in dir(backbones) if not x.startswith("_")]
+        print(f"    Available backbones: {available}")
+        raise RuntimeError("No suitable backbone found")
+
     model = PPMobileSeg(
         num_classes=2,
+        backbone=backbone,
         align_corners=False,
     )
 
@@ -64,7 +88,6 @@ def export_to_onnx():
         print(f"    Saved: {onnx_path}")
         return onnx_path
 
-    # Check if exported with different name
     for f in os.listdir(WORK_DIR):
         if f.endswith(".onnx"):
             found = os.path.join(WORK_DIR, f)
@@ -88,8 +111,6 @@ def simplify_onnx(onnx_path):
     from onnxsim import simplify
 
     model = onnx.load(onnx_path)
-
-    # Detect input name
     input_name = model.graph.input[0].name
     print(f"    Input name: {input_name}")
 
