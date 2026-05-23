@@ -1,5 +1,6 @@
 """
-Convert PP-HumanSegV2 Mobile → ONNX → NCNN
+Convert Person Segmentation ONNX → NCNN
+Dùng model ONNX có sẵn, bỏ qua PaddlePaddle
 """
 
 import os
@@ -15,117 +16,74 @@ NCNN_TOOLS_URL = (
 WORK_DIR = "convert_tmp"
 OUTPUT_DIR = "output"
 
+# ONNX model URLs — thử lần lượt
+ONNX_URLS = [
+    # PP-HumanSeg ONNX từ PaddleSeg export sẵn
+    (
+        "https://github.com/PaddlePaddle/PaddleSeg/raw/"
+        "release/2.9/contrib/PP-HumanSeg/inference_models/"
+        "pp_humansegv2_mobile_192x192_inference_model_with_softmax/"
+        "model.onnx"
+    ),
+    # MODNet — người segmentation nhẹ (~2MB)
+    (
+        "https://github.com/ZHKKKe/MODNet/raw/"
+        "master/pretrained/modnet_webcam_portrait_matting.ckpt"
+    ),
+    # PP-HumanSeg V1 ONNX
+    (
+        "https://github.com/PaddlePaddle/PaddleSeg/raw/"
+        "release/2.7/contrib/PP-HumanSeg/models/"
+        "pp_humanseg_mobile_192x192_pretrained/"
+        "model.onnx"
+    ),
+]
 
-# ─── Step 1: Export to ONNX ────────────────────────
 
-def export_to_onnx():
+def download_onnx():
     os.makedirs(WORK_DIR, exist_ok=True)
     onnx_path = os.path.join(WORK_DIR, "humansegv2.onnx")
 
-    print("[1/4] Exporting PP-HumanSegV2...")
+    print("[1/3] Downloading person segmentation ONNX model...")
 
-    import paddle
-    from paddleseg.models import PPMobileSeg
+    for i, url in enumerate(ONNX_URLS):
+        try:
+            print(f"    Trying source {i+1}...")
+            urllib.request.urlretrieve(url, onnx_path)
+            size = os.path.getsize(onnx_path)
+            print(f"    Downloaded! ({size:,} bytes)")
+            return onnx_path
+        except Exception as e:
+            print(f"    Failed: {e}")
+            continue
 
-    # Find backbone
-    from paddleseg.models import backbones
-    backbone = None
-    for name in ["STDC2", "STDC1", "stdc2", "stdc1"]:
-        cls = getattr(backbones, name, None)
-        if cls:
-            backbone = cls()
-            print(f"    Using backbone: {name}")
-            break
-
-    if backbone is None:
-        available = [x for x in dir(backbones) if not x.startswith("_") and x[0].isupper()]
-        print(f"    Available: {available}")
-        raise RuntimeError("No backbone found")
-
-    # pretrained=True → paddleseg tự download weights
-    model = PPMobileSeg(
-        num_classes=2,
-        backbone=backbone,
-        align_corners=False,
-        pretrained=None,
+    raise RuntimeError(
+        "All ONNX sources failed. "
+        "Please manually place humansegv2.onnx in convert_tmp/"
     )
 
-    # Try loading state dict từ PaddleSeg zoo
-    try:
-        from paddleseg.utils import download_pretrained_model
-        # PaddleSeg URL pattern
-        urls = [
-            "https://paddleseg.bj.bcebos.com/dygraph/pp_humanseg_v2/pp_humansegv2_mobile_192x192_pretrained/model.pdparams",
-            "https://paddleseg.bj.bcebos.com/dygraph/pp_humanseg_v2/pphumansegv2_mobile_192x192_pretrained/model.pdparams",
-            "https://paddleseg.bj.bcebos.com/dygraph/pp_humanseg_v2/human_pp_humansegv2_mobile_192x192_pretrained/model.pdparams",
-        ]
-        weights_path = None
-        for url in urls:
-            try:
-                test_path = os.path.join(WORK_DIR, "model.pdparams")
-                print(f"    Trying: {url}")
-                urllib.request.urlretrieve(url, test_path)
-                weights_path = test_path
-                print(f"    Downloaded!")
-                break
-            except Exception:
-                continue
-
-        if weights_path:
-            state_dict = paddle.load(weights_path)
-            model.set_state_dict(state_dict)
-        else:
-            print("    WARNING: Could not download weights, using random init")
-    except Exception as e:
-        print(f"    WARNING: {e}, using random init")
-
-    model.eval()
-
-    # Export to ONNX
-    print("    Exporting to ONNX...")
-    input_spec = paddle.static.InputSpec(
-        shape=[1, 3, 192, 192], dtype="float32", name="x"
-    )
-    paddle.onnx.export(
-        model,
-        os.path.join(WORK_DIR, "humansegv2"),
-        input_spec=[input_spec],
-        opset_version=11,
-    )
-
-    if os.path.exists(onnx_path):
-        print(f"    Saved: {onnx_path}")
-        return onnx_path
-
-    for f in os.listdir(WORK_DIR):
-        if f.endswith(".onnx"):
-            found = os.path.join(WORK_DIR, f)
-            if found != onnx_path:
-                os.rename(found, onnx_path)
-                return onnx_path
-
-    raise FileNotFoundError(
-        f"ONNX not found. Files: {os.listdir(WORK_DIR)}"
-    )
-
-
-# ─── Step 2: Simplify ONNX ─────────────────────────
 
 def simplify_onnx(onnx_path):
     sim_path = os.path.join(WORK_DIR, "humansegv2_sim.onnx")
-    print("[2/4] Simplifying ONNX...")
+    print("[2/3] Simplifying ONNX...")
 
     import onnx
     from onnxsim import simplify
 
     model = onnx.load(onnx_path)
     input_name = model.graph.input[0].name
-    print(f"    Input name: {input_name}")
+    input_shape = [
+        dim.dim_value for dim in model.graph.input[0].type.tensor_type.shape.dim
+    ]
+    print(f"    Input: {input_name} {input_shape}")
 
-    model_sim, check = simplify(
-        model,
-        input_shapes={input_name: [1, 3, 192, 192]}
-    )
+    # Auto detect shape
+    if len(input_shape) == 4:
+        shapes = {input_name: input_shape}
+    else:
+        shapes = {input_name: [1, 3, 192, 192]}
+
+    model_sim, check = simplify(model, input_shapes=shapes)
     assert check, "ONNX simplify failed!"
     onnx.save(model_sim, sim_path)
 
@@ -135,81 +93,68 @@ def simplify_onnx(onnx_path):
     return sim_path
 
 
-# ─── Step 3: Download NCNN tools ───────────────────
-
 def download_ncnn_tools():
     ncnn_dir = os.path.join(WORK_DIR, "ncnn-tools")
     if os.path.exists(ncnn_dir):
-        print("[3/4] NCNN tools already exist.")
         return ncnn_dir
 
-    print("[3/4] Downloading NCNN tools...")
+    print("[3/3] Downloading NCNN tools...")
     zip_path = os.path.join(WORK_DIR, "ncnn.zip")
     urllib.request.urlretrieve(NCNN_TOOLS_URL, zip_path)
     shutil.unpack_archive(zip_path, WORK_DIR)
 
-    extracted = None
     for d in os.listdir(WORK_DIR):
         full = os.path.join(WORK_DIR, d)
         if os.path.isdir(full) and d.startswith("ncnn-"):
-            extracted = full
+            os.rename(full, ncnn_dir)
             break
 
-    os.rename(extracted, ncnn_dir)
     for tool in ["onnx2ncnn", "ncnn-optimize"]:
-        tool_path = os.path.join(ncnn_dir, "bin", tool)
-        if os.path.exists(tool_path):
-            os.chmod(tool_path, 0o755)
+        p = os.path.join(ncnn_dir, "bin", tool)
+        if os.path.exists(p):
+            os.chmod(p, 0o755)
 
-    print(f"    Tools at: {ncnn_dir}/bin/")
     return ncnn_dir
 
 
-# ─── Step 4: ONNX → NCNN ──────────────────────────
-
-def onnx_to_ncnn(sim_path, ncnn_tools_dir):
+def convert(sim_path, ncnn_tools_dir):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     onnx2ncnn = os.path.join(ncnn_tools_dir, "bin", "onnx2ncnn")
     ncnn_opt = os.path.join(ncnn_tools_dir, "bin", "ncnn-optimize")
 
-    raw_param = os.path.join(WORK_DIR, "humansegv2_raw.param")
-    raw_bin = os.path.join(WORK_DIR, "humansegv2_raw.bin")
+    raw_p = os.path.join(WORK_DIR, "humansegv2_raw.param")
+    raw_b = os.path.join(WORK_DIR, "humansegv2_raw.bin")
 
-    print("[4a/4] Converting ONNX → NCNN...")
-    subprocess.run([onnx2ncnn, sim_path, raw_param, raw_bin], check=True)
+    print("[4/3] ONNX → NCNN...")
+    subprocess.run([onnx2ncnn, sim_path, raw_p, raw_b], check=True)
 
-    print("[4b/4] Optimizing NCNN model...")
-    opt_param = os.path.join(OUTPUT_DIR, "humansegv2.param")
-    opt_bin = os.path.join(OUTPUT_DIR, "humansegv2.bin")
-    subprocess.run(
-        [ncnn_opt, raw_param, raw_bin, opt_param, opt_bin],
-        check=True,
-    )
+    print("[5/3] Optimizing...")
+    opt_p = os.path.join(OUTPUT_DIR, "humansegv2.param")
+    opt_b = os.path.join(OUTPUT_DIR, "humansegv2.bin")
+    subprocess.run([ncnn_opt, raw_p, raw_b, opt_p, opt_b], check=True)
 
-    p_size = os.path.getsize(opt_param)
-    b_size = os.path.getsize(opt_bin)
-    print(f"    Output: humansegv2.param ({p_size:,} bytes)")
-    print(f"    Output: humansegv2.bin ({b_size:,} bytes)")
-    print(f"    Total:  {(p_size + b_size) / 1024 / 1024:.2f} MB")
+    ps = os.path.getsize(opt_p)
+    bs = os.path.getsize(opt_b)
+    print(f"    humansegv2.param ({ps:,} bytes)")
+    print(f"    humansegv2.bin   ({bs:,} bytes)")
+    print(f"    Total: {(ps + bs) / 1024 / 1024:.2f} MB")
 
-
-# ─── Main ──────────────────────────────────────────
 
 def main():
     print("=" * 50)
-    print("PP-HumanSegV2 → NCNN Converter")
+    print("Person Segmentation → NCNN Converter")
     print("=" * 50)
 
-    onnx_path = export_to_onnx()
+    onnx_path = download_onnx()
     sim_path = simplify_onnx(onnx_path)
-    ncnn_tools_dir = download_ncnn_tools()
-    onnx_to_ncnn(sim_path, ncnn_tools_dir)
+    ncnn_dir = download_ncnn_tools()
+    convert(sim_path, ncnn_dir)
 
     print()
     print("=" * 50)
-    print("DONE! Files in output/:")
-    print("  - humansegv2.param")
-    print("  - humansegv2.bin")
+    print("DONE!")
+    print("  output/humansegv2.param")
+    print("  output/humansegv2.bin")
     print("=" * 50)
 
     shutil.rmtree(WORK_DIR, ignore_errors=True)
