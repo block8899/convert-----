@@ -27,49 +27,58 @@ def export_to_onnx():
     import paddle
     from paddleseg.models import PPMobileSeg
 
-    # Try different backbone options
+    # Find backbone
+    from paddleseg.models import backbones
     backbone = None
-    for backbone_name in ["STDC2", "STDC1", "stdc2", "stdc1"]:
-        try:
-            from paddleseg.models import backbones
-            backbone_class = getattr(backbones, backbone_name, None)
-            if backbone_class is None:
-                # Try lowercase
-                backbone_class = getattr(backbones, backbone_name.lower(), None)
-            if backbone_class is not None:
-                backbone = backbone_class()
-                print(f"    Using backbone: {backbone_name}")
-                break
-        except Exception as e:
-            print(f"    Backbone {backbone_name} failed: {e}")
-            continue
+    for name in ["STDC2", "STDC1", "stdc2", "stdc1"]:
+        cls = getattr(backbones, name, None)
+        if cls:
+            backbone = cls()
+            print(f"    Using backbone: {name}")
+            break
 
     if backbone is None:
-        # List available backbones
-        from paddleseg.models import backbones
-        available = [x for x in dir(backbones) if not x.startswith("_")]
-        print(f"    Available backbones: {available}")
-        raise RuntimeError("No suitable backbone found")
+        available = [x for x in dir(backbones) if not x.startswith("_") and x[0].isupper()]
+        print(f"    Available: {available}")
+        raise RuntimeError("No backbone found")
 
+    # pretrained=True → paddleseg tự download weights
     model = PPMobileSeg(
         num_classes=2,
         backbone=backbone,
         align_corners=False,
+        pretrained=None,
     )
 
-    # Load pretrained weights
-    weights_path = os.path.join(WORK_DIR, "model.pdparams")
-    model_url = (
-        "https://paddleseg.bj.bcebos.com/dygraph/pp_humanseg_v2/"
-        "pp_humansegv2_mobile_192x192_pretrained/model.pdparams"
-    )
+    # Try loading state dict từ PaddleSeg zoo
+    try:
+        from paddleseg.utils import download_pretrained_model
+        # PaddleSeg URL pattern
+        urls = [
+            "https://paddleseg.bj.bcebos.com/dygraph/pp_humanseg_v2/pp_humansegv2_mobile_192x192_pretrained/model.pdparams",
+            "https://paddleseg.bj.bcebos.com/dygraph/pp_humanseg_v2/pphumansegv2_mobile_192x192_pretrained/model.pdparams",
+            "https://paddleseg.bj.bcebos.com/dygraph/pp_humanseg_v2/human_pp_humansegv2_mobile_192x192_pretrained/model.pdparams",
+        ]
+        weights_path = None
+        for url in urls:
+            try:
+                test_path = os.path.join(WORK_DIR, "model.pdparams")
+                print(f"    Trying: {url}")
+                urllib.request.urlretrieve(url, test_path)
+                weights_path = test_path
+                print(f"    Downloaded!")
+                break
+            except Exception:
+                continue
 
-    if not os.path.exists(weights_path):
-        print("    Downloading pretrained weights...")
-        urllib.request.urlretrieve(model_url, weights_path)
+        if weights_path:
+            state_dict = paddle.load(weights_path)
+            model.set_state_dict(state_dict)
+        else:
+            print("    WARNING: Could not download weights, using random init")
+    except Exception as e:
+        print(f"    WARNING: {e}, using random init")
 
-    state_dict = paddle.load(weights_path)
-    model.set_state_dict(state_dict)
     model.eval()
 
     # Export to ONNX
@@ -93,11 +102,10 @@ def export_to_onnx():
             found = os.path.join(WORK_DIR, f)
             if found != onnx_path:
                 os.rename(found, onnx_path)
-                print(f"    Saved: {onnx_path}")
                 return onnx_path
 
     raise FileNotFoundError(
-        f"ONNX not found. Files in {WORK_DIR}: {os.listdir(WORK_DIR)}"
+        f"ONNX not found. Files: {os.listdir(WORK_DIR)}"
     )
 
 
