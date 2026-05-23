@@ -16,7 +16,7 @@ WORK_DIR = "convert_tmp"
 OUTPUT_DIR = "output"
 
 
-# ─── Step 1: Export via paddleseg's built-in tools ─
+# ─── Step 1: Export to ONNX ────────────────────────
 
 def export_to_onnx():
     os.makedirs(WORK_DIR, exist_ok=True)
@@ -24,54 +24,35 @@ def export_to_onnx():
 
     print("[1/4] Exporting PP-HumanSegV2...")
 
-    # Download pretrained model using paddleseg's model zoo
     import paddle
     from paddleseg.models import PPMobileSeg
 
-    # Try loading model with minimal args
-    try:
-        model = PPMobileSeg(num_classes=2)
-    except TypeError:
-        # Fallback: introspect constructor
-        import inspect
-        sig = inspect.signature(PPMobileSeg.__init__)
-        print(f"    PPMobileSeg params: {list(sig.parameters.keys())}")
-        kwargs = {}
-        for p in sig.parameters.values():
-            if p.default is not inspect.Parameter.empty:
-                kwargs[p.name] = p.default
-            elif p.name in ('self',):
-                continue
-            elif p.name == 'num_classes':
-                kwargs[p.name] = 2
-        model = PPMobileSeg(**kwargs)
+    # Dùng đúng params: ['self', 'num_classes', 'backbone', 'head_use_dw', 'align_corners', 'pretrained', 'upsample']
+    model = PPMobileSeg(
+        num_classes=2,
+        align_corners=False,
+    )
 
-    # Download pretrained weights
+    # Load pretrained weights
+    weights_path = os.path.join(WORK_DIR, "model.pdparams")
     model_url = (
         "https://paddleseg.bj.bcebos.com/dygraph/pp_humanseg_v2/"
         "pp_humansegv2_mobile_192x192_pretrained/model.pdparams"
     )
-    weights_path = os.path.join(WORK_DIR, "model.pdparams")
 
     if not os.path.exists(weights_path):
         print("    Downloading pretrained weights...")
-        try:
-            urllib.request.urlretrieve(model_url, weights_path)
-        except Exception as e:
-            print(f"    Direct download failed: {e}")
-            # Try paddleseg's built-in download
-            from paddleseg.utils import download_pretrained_model
-            weights_path = download_pretrained_model(model_url)
+        urllib.request.urlretrieve(model_url, weights_path)
 
-    model.set_state_dict(paddle.load(weights_path))
+    state_dict = paddle.load(weights_path)
+    model.set_state_dict(state_dict)
     model.eval()
 
     # Export to ONNX
-    print("    Converting to ONNX...")
+    print("    Exporting to ONNX...")
     input_spec = paddle.static.InputSpec(
         shape=[1, 3, 192, 192], dtype="float32", name="x"
     )
-
     paddle.onnx.export(
         model,
         os.path.join(WORK_DIR, "humansegv2"),
@@ -79,13 +60,21 @@ def export_to_onnx():
         opset_version=11,
     )
 
-    exported = os.path.join(WORK_DIR, "humansegv2.onnx")
-    if os.path.exists(exported):
-        print(f"    Saved: {exported}")
-        return exported
+    if os.path.exists(onnx_path):
+        print(f"    Saved: {onnx_path}")
+        return onnx_path
+
+    # Check if exported with different name
+    for f in os.listdir(WORK_DIR):
+        if f.endswith(".onnx"):
+            found = os.path.join(WORK_DIR, f)
+            if found != onnx_path:
+                os.rename(found, onnx_path)
+                print(f"    Saved: {onnx_path}")
+                return onnx_path
 
     raise FileNotFoundError(
-        f"ONNX export failed. Files in {WORK_DIR}: {os.listdir(WORK_DIR)}"
+        f"ONNX not found. Files in {WORK_DIR}: {os.listdir(WORK_DIR)}"
     )
 
 
@@ -99,9 +88,14 @@ def simplify_onnx(onnx_path):
     from onnxsim import simplify
 
     model = onnx.load(onnx_path)
+
+    # Detect input name
+    input_name = model.graph.input[0].name
+    print(f"    Input name: {input_name}")
+
     model_sim, check = simplify(
         model,
-        input_shapes={"x": [1, 3, 192, 192]}
+        input_shapes={input_name: [1, 3, 192, 192]}
     )
     assert check, "ONNX simplify failed!"
     onnx.save(model_sim, sim_path)
