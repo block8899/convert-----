@@ -42,7 +42,7 @@ print(f"   Simplified: {os.path.getsize(SIMPLIFIED)/1024/1024:.1f} MB")
 
 print("3. Converting ONNX → NCNN via pnnx CLI...")
 result = subprocess.run(
-    ["pnnx", SIMPLIFIED, "inputshape=1,3,320,320"],
+    ["pnnx", "u2netp_simple.onnx", "inputshape=1,3,320,320"],
     capture_output=True,
     text=True,
     timeout=300,
