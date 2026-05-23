@@ -18,10 +18,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install paddle2onnx onnx onnxsim
+          pip install numpy==1.26.4
+          pip install opencv-python-headless==4.10.0.84
           pip install paddlepaddle==2.6.2
-          pip install paddleseg
-
+          pip install paddle2onnx onnx onnxsim paddleseg
+          
       - name: Run conversion script
         run: python tools/convert_humanseg.py
 
