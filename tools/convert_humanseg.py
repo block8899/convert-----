@@ -7,6 +7,7 @@ import os
 import subprocess
 import shutil
 import urllib.request
+import sys
 
 WORK_DIR = "convert_tmp"
 OUTPUT_DIR = "output"
