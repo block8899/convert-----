@@ -1,0 +1,66 @@
+name: Convert BiSeNet to NCNN
+
+on:
+  workflow_dispatch:
+
+jobs:
+  convert:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Setup Swap
+        run: |
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile 2>/dev/null || true
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+      - name: Install ncnn tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libprotobuf-dev protobuf-compiler
+          wget -q https://github.com/Tencent/ncnn/releases/download/20240820/ncnn-20240820-ubuntu-2204.zip
+          unzip -q ncnn-20240820-ubuntu-2204.zip
+          sudo cp ncnn-20240820-ubuntu-2204/bin/onnx2ncnn /usr/local/bin/
+          sudo cp ncnn-20240820-ubuntu-2204/bin/ncnnoptimize /usr/local/bin/
+          sudo chmod +x /usr/local/bin/onnx2ncnn /usr/local/bin/ncnnoptimize
+          onnx2ncnn 2>&1 | head -3 || true
+          ncnnoptimize 2>&1 | head -3 || true
+
+      - name: Install Python deps
+        run: |
+          pip install --upgrade pip
+          pip install "numpy<2"
+          pip install torch==2.1.0+cpu torchvision==0.16.0+cpu \
+            --index-url https://download.pytorch.org/whl/cpu
+          pip install onnxsim onnx gdown onnxscript
+
+      - name: Clone BiSeNet repo
+        run: git clone https://github.com/zllrunning/face-parsing.PyTorch.git repo_bisenet
+
+      - name: Download BiSeNet weights
+        run: |
+          gdown "1D7SK1aFzQ30ZEd-Q0L7I5xBjRKMnvmZL" -O repo_bisenet/79999_iter.pth
+          ls -lh repo_bisenet/79999_iter.pth
+
+      - name: Convert BiSeNet
+        timeout-minutes: 30
+        run: python scripts/convert_bisenet.py
+
+      - name: Verify
+        run: ls -lh output/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncnn-models
+          path: output/
+          retention-days: 30
