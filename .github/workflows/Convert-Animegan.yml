@@ -28,21 +28,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libprotobuf-dev protobuf-compiler
 
-          # Lấy version mới nhất
           NCNN_VER=$(curl -s https://api.github.com/repos/Tencent/ncnn/releases/latest \
             | grep -oP '"tag_name": "\K[^"]+')
           echo "Latest ncnn version: $NCNN_VER"
 
-          # Liệt kê tất cả assets để debug
+          # Liệt kê assets
           echo "--- Available assets ---"
-          curl -s "https://api.github.com/repos/Tencent/ncnn/releases/latest" \
-            | grep '"name"' | grep -i ubuntu || true
+          ASSETS=$(curl -s "https://api.github.com/repos/Tencent/ncnn/releases/latest" \
+            | grep -oP '"name": "\K[^"]*' | grep '\.zip$')
+          echo "$ASSETS"
 
-          # Tìm asset phù hợp — ưu tiên ubuntu-2404, rồi ubuntu-2204, rồi ubuntu chung
+          # Tìm asset: ưu tiên ubuntu-2404 không shared, rồi ubuntu-2204 không shared
           ZIP_NAME=""
-          for pattern in "ubuntu-2404" "ubuntu-2204" "ubuntu-2004" "ubuntu"; do
-            ZIP_NAME=$(curl -s "https://api.github.com/repos/Tencent/ncnn/releases/latest" \
-              | grep -oP '"name": "\K[^"]*' | grep -i "${pattern}" | grep '\.zip$' | head -1)
+          for pattern in "ubuntu-2404.zip" "ubuntu-2204.zip" "ubuntu-2004.zip"; do
+            ZIP_NAME=$(echo "$ASSETS" | grep "$pattern" | head -1)
             if [ -n "$ZIP_NAME" ]; then
               echo "Found asset: $ZIP_NAME"
               break
@@ -50,19 +49,16 @@ jobs:
           done
 
           if [ -z "$ZIP_NAME" ]; then
-            echo "ERROR: No ubuntu zip found in release $NCNN_VER"
-            curl -s "https://api.github.com/repos/Tencent/ncnn/releases/latest" \
-              | grep '"name":' || true
+            echo "ERROR: No suitable ubuntu zip found in $NCNN_VER"
             exit 1
           fi
 
-          # Tải về
           wget -q "https://github.com/Tencent/ncnn/releases/download/${NCNN_VER}/${ZIP_NAME}"
           unzip -q "$ZIP_NAME"
 
-          # Tìm thư mục giải nén
-          NCNN_DIR=$(ls -d ncnn-*/ 2>/dev/null | head -1)
+          NCNN_DIR=$(ls -d ncnn-${NCNN_VER}-ubuntu-*/ 2>/dev/null | grep -v shared | head -1)
           echo "Extracted dir: $NCNN_DIR"
+          ls "${NCNN_DIR}bin/" || true
 
           sudo cp "${NCNN_DIR}bin/onnx2ncnn" /usr/local/bin/
           sudo cp "${NCNN_DIR}bin/ncnnoptimize" /usr/local/bin/
