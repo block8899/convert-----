@@ -1,4 +1,4 @@
-name: Convert WDN → ncnn
+name: Convert WDN-x4v3 to NCNN
 
 on:
   workflow_dispatch:
@@ -6,38 +6,36 @@ on:
 jobs:
   convert:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
       - name: Install deps
         run: |
-          pip install numpy==1.26.4
-          pip install torch==2.1.0+cpu --index-url https://download.pytorch.org/whl/cpu
-          pip install ncnn onnx
+          pip install --upgrade pip
+          pip install --no-cache-dir torch==2.1.0+cpu --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-cache-dir pnnx onnx numpy==1.26.4
 
       - name: Download model
         run: |
-          mkdir -p models
           wget -q "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth" \
-            -O models/realesr-general-wdn-x4v3.pth
+            -O wdn-x4v3.pth
+          ls -lh wdn-x4v3.pth
 
-      - name: Convert PyTorch → ncnn (all-in-one)
-        working-directory: models
-        run: python ${{ github.workspace }}/scripts/convert.py
+      - name: Convert to NCNN
+        run: python scripts/convert_ncnn.py
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: wdn-x4v3-ncnn
           path: |
-            models/wdn-x4v3.param
-            models/wdn-x4v3.bin
+            wdn-x4v3.ncnn.param
+            wdn-x4v3.ncnn.bin
           retention-days: 30
