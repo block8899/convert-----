@@ -1,0 +1,36 @@
+# wdn_x4v3.yml
+name: realesr-general-wdn-x4v3
+model_type: RealESRGANModel
+scale: 4
+num_gpu: 0
+
+network_g:
+  type: SRVGGNetCompact
+  num_in_ch: 12    # 3 input + 3*3 wavelet decomposition
+  num_out_ch: 3
+  num_feat: 64
+  num_conv: 23
+  upscale: 4
+  act_type: prelu
+
+network_d: ~
+
+datasets:
+  train:
+    name: train
+    type: PairedImageDataset
+    dataroot_gt: ~
+    dataroot_lq: ~
+  val:
+    name: val
+    type: PairedImageDataset
+    dataroot_gt: ~
+    dataroot_lq: ~
+
+path:
+  pretrain_network_g: realesr-general-wdn-x4v3.pth
+  strict_load_g: false
+
+val:
+  save_img: true
+  suffix: ~
