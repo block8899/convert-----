@@ -31,27 +31,38 @@ jobs:
 
       - name: PyTorch → ONNX
         working-directory: models
-        run: python ${{ github.workspace }}/scripts/export_to_onnx.py --input realesr-general-wdn-x4v3.pth --output realesr-general-wdn-x4v3.onnx
-
-      - name: Build ncnn tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake libprotobuf-dev protobuf-compiler
-          git clone --depth 1 https://github.com/Tencent/ncnn.git ncnn-src
-          cd ncnn-src && git submodule update --init
-          mkdir build && cd build
-          cmake -DNCNN_VULKAN=OFF -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_TOOLS=ON -DNCNN_BUILD_BENCHMARK=OFF ..
-          cmake --build . -j$(nproc)
-          cp tools/onnx2ncnn/onnx2ncnn ${{ github.workspace }}/
-          cp tools/ncnnoptimize/ncnnoptimize ${{ github.workspace }}/
+          python ${{ github.workspace }}/scripts/export_to_onnx.py \
+            --input realesr-general-wdn-x4v3.pth \
+            --output realesr-general-wdn-x4v3.onnx
 
-      - name: ONNX → ncnn
+      - name: Download PNNX
+        run: |
+          wget -q "https://github.com/pnnx/pnnx/releases/download/20240826/pnnx-20240826-ubuntu.zip" -O pnnx.zip
+          unzip -q pnnx.zip
+          chmod +x pnnx
+          ./pnnx --version || echo "pnnx ok"
+
+      - name: ONNX → ncnn via PNNX
         working-directory: models
         run: |
-          ${{ github.workspace }}/onnx2ncnn realesr-general-wdn-x4v3.onnx realesr-general-wdn-x4v3.param realesr-general-wdn-x4v3.bin
-          ${{ github.workspace }}/ncnnoptimize realesr-general-wdn-x4v3.param realesr-general-wdn-x4v3.bin realesr-general-wdn-x4v3.param realesr-general-wdn-x4v3.bin 65536
+          ${{ github.workspace }}/pnnx \
+            realesr-general-wdn-x4v3.onnx \
+            inputshape="[1,3,64,64]"
+
+          # PNNX output: *.ncnn.param + *.ncnn.bin
+          ls -lh *.ncnn.* 2>/dev/null || ls -lh *
+
+          # Rename
+          cp realesr-general-wdn-x4v3.ncnn.param realesr-general-wdn-x4v3.param 2>/dev/null || \
+          cp realesr-general-wdn-x4v3.onnx.ncnn.param realesr-general-wdn-x4v3.param 2>/dev/null
+
+          cp realesr-general-wdn-x4v3.ncnn.bin realesr-general-wdn-x4v3.bin 2>/dev/null || \
+          cp realesr-general-wdn-x4v3.onnx.ncnn.bin realesr-general-wdn-x4v3.bin 2>/dev/null
+
+          echo "=== Result ==="
           head -5 realesr-general-wdn-x4v3.param
-          ls -lh *.param *.bin
+          ls -lh realesr-general-wdn-x4v3.param realesr-general-wdn-x4v3.bin
 
       - name: Upload
         uses: actions/upload-artifact@v4
@@ -61,4 +72,3 @@ jobs:
             models/realesr-general-wdn-x4v3.param
             models/realesr-general-wdn-x4v3.bin
           retention-days: 30
-
