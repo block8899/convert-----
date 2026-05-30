@@ -21,66 +21,23 @@ jobs:
         run: |
           pip install numpy==1.26.4
           pip install torch==2.1.0+cpu --index-url https://download.pytorch.org/whl/cpu
-          pip install onnx==1.15.0 onnxsim==0.4.35
+          pip install ncnn onnx
 
       - name: Download model
         run: |
           mkdir -p models
           wget -q "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth" \
             -O models/realesr-general-wdn-x4v3.pth
-          ls -lh models/
 
-      - name: PyTorch → ONNX
+      - name: Convert PyTorch → ncnn (all-in-one)
         working-directory: models
-        run: |
-          python ${{ github.workspace }}/scripts/export_to_onnx.py \
-            --input realesr-general-wdn-x4v3.pth \
-            --output realesr-general-wdn-x4v3.onnx
-          ls -lh *.onnx
-
-      # ═══════════════════════════════════════════════
-      # Download ncnn pre-built (có sẵn onnx2ncnn)
-      # ═══════════════════════════════════════════════
-      - name: Download ncnn tools
-        run: |
-          wget -q "https://github.com/Tencent/ncnn/releases/download/20230816/ncnn-20230816-ubuntu-2204.zip" \
-            -O ncnn.zip
-          unzip -q ncnn.zip -d ncnn-prebuilt
-
-          # Verify
-          ls ncnn-prebuilt/ncnn-20230816-ubuntu-2204/bin/
-          chmod +x ncnn-prebuilt/ncnn-20230816-ubuntu-2204/bin/onnx2ncnn
-          chmod +x ncnn-prebuilt/ncnn-20230816-ubuntu-2204/bin/ncnnoptimize
-          echo "ncnn tools ready"
-
-      - name: ONNX → ncnn
-        working-directory: models
-        run: |
-          NCNN_BIN=${{ github.workspace }}/ncnn-prebuilt/ncnn-20230816-ubuntu-2204/bin
-
-          echo "=== onnx2ncnn ==="
-          $NCNN_BIN/onnx2ncnn \
-            realesr-general-wdn-x4v3.onnx \
-            realesr-general-wdn-x4v3.param \
-            realesr-general-wdn-x4v3.bin
-
-          echo "=== ncnnoptimize ==="
-          $NCNN_BIN/ncnnoptimize \
-            realesr-general-wdn-x4v3.param \
-            realesr-general-wdn-x4v3.bin \
-            realesr-general-wdn-x4v3-opt.param \
-            realesr-general-wdn-x4v3-opt.bin \
-            65536
-
-          echo "=== Verify ==="
-          head -5 realesr-general-wdn-x4v3-opt.param
-          ls -lh *-opt.param *-opt.bin
+        run: python ${{ github.workspace }}/scripts/convert.py
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: wdn-x4v3-ncnn
           path: |
-            models/realesr-general-wdn-x4v3-opt.param
-            models/realesr-general-wdn-x4v3-opt.bin
+            models/wdn-x4v3.param
+            models/wdn-x4v3.bin
           retention-days: 30
