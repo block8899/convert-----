@@ -1,4 +1,4 @@
-name: Convert WDN → ncnn (PNNX)
+name: Convert WDN → ncnn
 
 on:
   workflow_dispatch:
@@ -6,6 +6,7 @@ on:
 jobs:
   convert:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -16,71 +17,85 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install PyTorch + ONNX
         run: |
-          pip install torch==2.1.0+cpu \
+          pip install torch==2.1.0+cpu torchvision==0.16.0+cpu \
                       --index-url https://download.pytorch.org/whl/cpu
-          pip install torchvision==0.16.0+cpu \
-                      --index-url https://download.pytorch.org/whl/cpu
+          pip install onnx==1.15.0 onnxsim==0.4.35
 
       - name: Download model
         run: |
           mkdir -p models
-          wget -q \
-            "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth" \
+          wget -q "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth" \
             -O models/realesr-general-wdn-x4v3.pth
           ls -lh models/
 
-      - name: Download PNNX
-        run: |
-          # PNNX pre-built binary — không cần build ncnn
-          wget -q \
-            "https://github.com/pnnx/pnnx/releases/download/20240410/pnnx-20240410-ubuntu.zip" \
-            -O pnnx.zip
-          unzip -q pnnx.zip -d pnnx-tool
-          chmod +x pnnx-tool/pnnx/pnnx
-          ls -la pnnx-tool/pnnx/
-
-      - name: Generate torchscript and run PNNX
+      - name: PyTorch → ONNX
         working-directory: models
         run: |
-          python $GITHUB_WORKSPACE/scripts/export_wdn_pnnx.py \
+          python ${{ github.workspace }}/scripts/export_wdn_to_onnx.py \
             --input realesr-general-wdn-x4v3.pth \
-            --output-dir $GITHUB_WORKSPACE/models
+            --output realesr-general-wdn-x4v3.onnx
 
-      - name: Run PNNX converter
+      # ══════════════════════════════════════════════════
+      # CÁCH ĐÚNG: build ncnn — KHÔNG specify individual target
+      # ══════════════════════════════════════════════════
+      - name: Build ncnn tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake libprotobuf-dev protobuf-compiler
+
+          git clone --depth 1 https://github.com/Tencent/ncnn.git ncnn-src
+          cd ncnn-src
+          git submodule update --init
+
+          mkdir build && cd build
+          cmake -DNCNN_VULKAN=OFF \
+                -DNCNN_BUILD_EXAMPLES=OFF \
+                -DNCNN_BUILD_TOOLS=ON \
+                -DNCNN_BUILD_BENCHMARK=OFF \
+                ..
+
+          # ✅ Build TẤT CẢ — không ghi tên target cụ thể
+          cmake --build . -j$(nproc)
+
+          # Verify tools exist
+          ls -la tools/onnx2ncnn/onnx2ncnn
+          ls -la tools/ncnnoptimize/ncnnoptimize
+
+          # Copy ra workspace
+          cp tools/onnx2ncnn/onnx2ncnn    ${{ github.workspace }}/
+          cp tools/ncnnoptimize/ncnnoptimize ${{ github.workspace }}/
+          chmod +x ${{ github.workspace }}/onnx2ncnn
+          chmod +x ${{ github.workspace }}/ncnnoptimize
+
+      - name: ONNX → ncnn
         working-directory: models
         run: |
-          $GITHUB_WORKSPACE/pnnx-tool/pnnx/pnnx \
-            wdn_script.pt \
-            inputshape="[1,3,64,64]"
+          echo "=== Convert ONNX → ncnn ==="
+          ${{ github.workspace }}/onnx2ncnn \
+            realesr-general-wdn-x4v3.onnx \
+            realesr-general-wdn-x4v3.param \
+            realesr-general-wdn-x4v3.bin
 
-          echo "=== Output files ==="
-          ls -lh *.param *.bin 2>/dev/null || echo "No ncnn files found"
-          ls -lh wdn_script* 2>/dev/null
+          echo "=== Optimize ==="
+          ${{ github.workspace }}/ncnnoptimize \
+            realesr-general-wdn-x4v3.param \
+            realesr-general-wdn-x4v3.bin \
+            realesr-general-wdn-x4v3-opt.param \
+            realesr-general-wdn-x4v3-opt.bin \
+            65536
 
-      - name: Rename output
-        working-directory: models
-        run: |
-          # PNNX output: wdn_script.ncnn.param / .bin
-          if [ -f "wdn_script.ncnn.param" ]; then
-            cp wdn_script.ncnn.param realesr-general-wdn-x4v3.param
-            cp wdn_script.ncnn.bin realesr-general-wdn-x4v3.bin
-            echo "=== Verify ==="
-            head -5 realesr-general-wdn-x4v3.param
-            echo "---"
-            wc -l realesr-general-wdn-x4v3.param
-          else
-            echo "ERROR: ncnn output not found"
-            ls -la
-            exit 1
-          fi
+          echo "=== Verify ==="
+          head -5 realesr-general-wdn-x4v3-opt.param
+          echo "---"
+          ls -lh *.param *.bin
 
       - name: Upload ncnn model
         uses: actions/upload-artifact@v4
         with:
           name: wdn-x4v3-ncnn
           path: |
-            models/realesr-general-wdn-x4v3.param
-            models/realesr-general-wdn-x4v3.bin
+            models/realesr-general-wdn-x4v3-opt.param
+            models/realesr-general-wdn-x4v3-opt.bin
           retention-days: 30
