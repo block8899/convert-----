@@ -17,10 +17,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install PyTorch + ONNX
+      - name: Install deps
         run: |
-          pip install torch==2.1.0+cpu torchvision==0.16.0+cpu \
-                      --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy==1.26.4
+          pip install torch==2.1.0+cpu --index-url https://download.pytorch.org/whl/cpu
           pip install onnx==1.15.0 onnxsim==0.4.35
 
       - name: Download model
@@ -28,74 +28,35 @@ jobs:
           mkdir -p models
           wget -q "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth" \
             -O models/realesr-general-wdn-x4v3.pth
-          ls -lh models/
 
       - name: PyTorch → ONNX
         working-directory: models
-        run: |
-          python ${{ github.workspace }}/scripts/export_wdn_to_onnx.py \
-            --input realesr-general-wdn-x4v3.pth \
-            --output realesr-general-wdn-x4v3.onnx
+        run: python ${{ github.workspace }}/scripts/export_to_onnx.py --input realesr-general-wdn-x4v3.pth --output realesr-general-wdn-x4v3.onnx
 
-      # ══════════════════════════════════════════════════
-      # CÁCH ĐÚNG: build ncnn — KHÔNG specify individual target
-      # ══════════════════════════════════════════════════
       - name: Build ncnn tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake libprotobuf-dev protobuf-compiler
-
           git clone --depth 1 https://github.com/Tencent/ncnn.git ncnn-src
-          cd ncnn-src
-          git submodule update --init
-
+          cd ncnn-src && git submodule update --init
           mkdir build && cd build
-          cmake -DNCNN_VULKAN=OFF \
-                -DNCNN_BUILD_EXAMPLES=OFF \
-                -DNCNN_BUILD_TOOLS=ON \
-                -DNCNN_BUILD_BENCHMARK=OFF \
-                ..
-
-          # ✅ Build TẤT CẢ — không ghi tên target cụ thể
+          cmake -DNCNN_VULKAN=OFF -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_TOOLS=ON -DNCNN_BUILD_BENCHMARK=OFF ..
           cmake --build . -j$(nproc)
-
-          # Verify tools exist
-          ls -la tools/onnx2ncnn/onnx2ncnn
-          ls -la tools/ncnnoptimize/ncnnoptimize
-
-          # Copy ra workspace
-          cp tools/onnx2ncnn/onnx2ncnn    ${{ github.workspace }}/
+          cp tools/onnx2ncnn/onnx2ncnn ${{ github.workspace }}/
           cp tools/ncnnoptimize/ncnnoptimize ${{ github.workspace }}/
-          chmod +x ${{ github.workspace }}/onnx2ncnn
-          chmod +x ${{ github.workspace }}/ncnnoptimize
 
       - name: ONNX → ncnn
         working-directory: models
         run: |
-          echo "=== Convert ONNX → ncnn ==="
-          ${{ github.workspace }}/onnx2ncnn \
-            realesr-general-wdn-x4v3.onnx \
-            realesr-general-wdn-x4v3.param \
-            realesr-general-wdn-x4v3.bin
-
-          echo "=== Optimize ==="
-          ${{ github.workspace }}/ncnnoptimize \
-            realesr-general-wdn-x4v3.param \
-            realesr-general-wdn-x4v3.bin \
-            realesr-general-wdn-x4v3-opt.param \
-            realesr-general-wdn-x4v3-opt.bin \
-            65536
-
-          echo "=== Verify ==="
-          head -5 realesr-general-wdn-x4v3-opt.param
-          echo "---"
+          ${{ github.workspace }}/onnx2ncnn realesr-general-wdn-x4v3.onnx realesr-general-wdn-x4v3.param realesr-general-wdn-x4v3.bin
+          ${{ github.workspace }}/ncnnoptimize realesr-general-wdn-x4v3.param realesr-general-wdn-x4v3.bin realesr-general-wdn-x4v3.param realesr-general-wdn-x4v3.bin 65536
+          head -5 realesr-general-wdn-x4v3.param
           ls -lh *.param *.bin
 
-      - name: Upload ncnn model
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: wdn-x4v3-ncnn
-          path: |
-            models/realesr-general-wdn-x4v3-opt.param
-            models/realesr-general-wdn-x4v3-opt.bin
+          path: models/realesr-general-wdn-x4v3.param
+          path: models/realesr-general-wdn-x4v3.bin
           retention-days: 30
