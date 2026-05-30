@@ -57,6 +57,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wdn-x4v3-ncnn
-          path: models/realesr-general-wdn-x4v3.param
-          path: models/realesr-general-wdn-x4v3.bin
+          path: |
+            models/realesr-general-wdn-x4v3.param
+            models/realesr-general-wdn-x4v3.bin
           retention-days: 30
+
