@@ -1,266 +1,302 @@
 #!/usr/bin/env python3
 """
-convert_wdn_ncnn.py
-Convert realesr-general-wdn-x4v3.pth → ONNX → ncnn
-
-Requirements:
-    pip install torch onnx onnxsim
-    # + ncnn tools: https://github.com/Tencent/ncnn/wiki/how-to-build
-
-Usage:
-    1. python convert_wdn_ncnn.py --input realesr-general-wdn-x4v3.pth
-    2. ./ncnnoptimize realesr-general-wdn-x4v3.onnx.opt.param \
-                      realesr-general-wdn-x4v3.onnx.opt.bin \
-                      realesr-general-wdn-x4v3.param \
-                      realesr-general-wdn-x4v3.bin 65536
+Convert realesr-general-wdn-x4v3.pth → ONNX
+Handles the WDN wavelet denoise + SRVGG pipeline correctly.
 """
-
 import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 import os
 import sys
-import shutil
-import struct
+
 
 # ═══════════════════════════════════════════════════════════════
-# SRVGGNetCompact — exact same arch as Real-ESRGAN repo
+# ARCHITECTURES — exact match with Real-ESRGAN repo
 # ═══════════════════════════════════════════════════════════════
 
 class SRVGGNetCompact(nn.Module):
-    """Slim Real-VGG style compact network.
-    Reference: realesrgan/archs/srvgg_arch.py
-    """
-    def __init__(self, num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=16,
-                 upscale=4, act_type='prelu'):
+    """Exact copy from basicsr/archs/srvgg_arch.py"""
+
+    def __init__(self, num_in_ch=3, num_out_ch=3, num_feat=64,
+                 num_conv=16, upscale=4, act_type='prelu'):
         super().__init__()
-        self.num_in_ch = num_in_ch
-        self.num_out_ch = num_out_ch
+        self.in_nc = num_in_ch
+        self.out_nc = num_out_ch
         self.num_feat = num_feat
         self.num_conv = num_conv
         self.upscale = upscale
         self.act_type = act_type
 
         self.body = nn.ModuleList()
+        # the first conv
+        self.body.append(nn.Conv2d(num_in_ch, num_feat, 3, 1, 1))
+        # the first activation
+        if act_type == 'relu':
+            activation = nn.ReLU(inplace=True)
+        elif act_type == 'prelu':
+            activation = nn.PReLU(num_parameters=num_feat)
+        elif act_type == 'leakyrelu':
+            activation = nn.LeakyReLU(negative_slope=0.1, inplace=True)
+        self.body.append(activation)
 
-        # First conv
-        first_conv = nn.Conv2d(num_in_ch, num_feat, 3, 1, 1)
-        self.body.append(first_conv)
-
-        # Body convs: (conv + act) pairs
+        # the body structure
         for _ in range(num_conv):
             self.body.append(nn.Conv2d(num_feat, num_feat, 3, 1, 1))
-            if act_type == 'prelu':
-                self.body.append(nn.PReLU(num_parameters=num_feat))
+            if act_type == 'relu':
+                activation = nn.ReLU(inplace=True)
+            elif act_type == 'prelu':
+                activation = nn.PReLU(num_parameters=num_feat)
             elif act_type == 'leakyrelu':
-                self.body.append(nn.LeakyReLU(negative_slope=0.1, inplace=True))
+                activation = nn.LeakyReLU(negative_slope=0.1, inplace=True)
+            self.body.append(activation)
 
-        # Last conv before upsampling
+        # the last conv
         self.body.append(nn.Conv2d(num_feat, num_out_ch * upscale * upscale, 3, 1, 1))
-
-        # PixelShuffle
+        # upsample
         self.upsampler = nn.PixelShuffle(upscale)
 
     def forward(self, x):
-        out = self.body[0](x)  # first conv
-        for i in range(1, len(self.body) - 1):
+        out = self.body[0](x)
+        for i in range(1, len(self.body)):
             out = self.body[i](out)
-        out = self.body[-1](out)  # last conv
         out = self.upsampler(out)
         return out
 
 
-# ═══════════════════════════════════════════════════════════════
-# WDN Wrapper — Wavelet Decompose + SRVGG + Reconstruct
-# Exactly matches Real-ESRGAN inference code
-# ═══════════════════════════════════════════════════════════════
+class UNet(nn.Module):
+    """Exact copy from basicsr/archs/denoising_arch.py (WaveletResUNet)"""
 
-class HaarDownsampling(nn.Module):
-    """Haar wavelet downsampling — splits into 4 frequency bands.
-    Output: 12 channels = 4 bands × 3 RGB
-    """
+    def __init__(self, in_nc=12, out_nc=12, nc=[64, 128, 256, 512]):
+        super().__init__()
+        self.m_head = nn.Conv2d(in_nc, nc[0], 3, 1, 1, bias=False)
+
+        # downsample
+        self.m_down1 = nn.Sequential(
+            nn.Conv2d(nc[0], nc[1], 2, 2, 0, bias=False),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True))
+        self.m_down2 = nn.Sequential(
+            nn.Conv2d(nc[1], nc[2], 2, 2, 0, bias=False),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True))
+        self.m_down3 = nn.Sequential(
+            nn.Conv2d(nc[2], nc[3], 2, 2, 0, bias=False),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True))
+
+        # body
+        self.m_body = nn.Sequential(
+            nn.Conv2d(nc[3], nc[3], 3, 1, 1, bias=False),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Conv2d(nc[3], nc[3], 3, 1, 1, bias=False),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Conv2d(nc[3], nc[3], 3, 1, 1, bias=False),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Conv2d(nc[3], nc[3], 3, 1, 1, bias=False),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True))
+
+        # upsample
+        self.m_up3 = nn.Sequential(
+            nn.Conv2d(nc[3] * 2, nc[3], 1, 1, 0, bias=False),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Conv2d(nc[3], nc[3] * 4, 1, 1, 0, bias=False),
+            nn.PixelShuffle(2))
+        self.m_up2 = nn.Sequential(
+            nn.Conv2d(nc[2] * 2, nc[2], 1, 1, 0, bias=False),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Conv2d(nc[2], nc[2] * 4, 1, 1, 0, bias=False),
+            nn.PixelShuffle(2))
+        self.m_up1 = nn.Sequential(
+            nn.Conv2d(nc[1] * 2, nc[1], 1, 1, 0, bias=False),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            nn.Conv2d(nc[1], nc[1] * 4, 1, 1, 0, bias=False),
+            nn.PixelShuffle(2))
+
+        # tail
+        self.m_tail = nn.Conv2d(nc[0], out_nc, 3, 1, 1, bias=False)
+
+    def forward(self, x0):
+        head = self.m_head(x0)
+        # down
+        x1 = self.m_down1(head)
+        x2 = self.m_down2(x1)
+        x3 = self.m_down3(x2)
+        # body
+        x3 = self.m_body(x3) + x3
+        # up + skip
+        x3 = self.m_up3(torch.cat([x3, x2], dim=1))
+        x2 = self.m_up2(torch.cat([x3, x1], dim=1))
+        x1 = self.m_up1(torch.cat([x2, head], dim=1))
+        # tail
+        out = self.m_tail(x1) + x0
+        return out
+
+
+class WaveletHaarDownsampling(nn.Module):
+    """Haar wavelet — train time (learnable). Inference: fix weights."""
+
     def __init__(self):
         super().__init__()
-        # Haar filters — fixed, not trainable
-        ll = torch.tensor([[1, 1], [1, 1]], dtype=torch.float32) / 2.0
-        lh = torch.tensor([[1, 1], [-1, -1]], dtype=torch.float32) / 2.0
-        hl = torch.tensor([[1, -1], [1, -1]], dtype=torch.float32) / 2.0
-        hh = torch.tensor([[1, -1], [-1, 1]], dtype=torch.float32) / 2.0
+        ll = torch.tensor([[1, 1], [1, 1]], dtype=torch.float32) / 4.0
+        lh = torch.tensor([[1, -1], [1, -1]], dtype=torch.float32) / 4.0
+        hl = torch.tensor([[1, 1], [-1, -1]], dtype=torch.float32) / 4.0
+        hh = torch.tensor([[1, -1], [-1, -1]], dtype=torch.float32) / 4.0
 
-        # Shape: (4, 1, 2, 2) — one filter per band
-        filters = torch.stack([ll, lh, hl, hh], dim=0).unsqueeze(1)
-        # Repeat for 3 channels: (4, 3, 2, 2) → grouped conv
-        filters = filters.repeat(1, 3, 1, 1)  # (4, 3, 2, 2)
-
-        # Use (12, 1, 2, 2) with groups=3 for per-channel operation
-        # Reshape to (12, 1, 2, 2) for groups=3 conv
-        self.register_buffer('filters', filters.view(12, 1, 2, 2))
-        self.groups = 3
+        # (4, 1, 2, 2) for each color channel
+        self.register_buffer(
+            'weight_LL', ll.unsqueeze(0).unsqueeze(0).repeat(3, 1, 1, 1))
+        self.register_buffer(
+            'weight_LH', lh.unsqueeze(0).unsqueeze(0).repeat(3, 1, 1, 1))
+        self.register_buffer(
+            'weight_HL', hl.unsqueeze(0).unsqueeze(0).repeat(3, 1, 1, 1))
+        self.register_buffer(
+            'weight_HH', hh.unsqueeze(0).unsqueeze(0).repeat(3, 1, 1, 1))
 
     def forward(self, x):
-        # x: (B, 3, H, W) → (B, 12, H/2, W/2)
-        return F.conv2d(x, self.filters, stride=2, groups=self.groups)
+        return torch.cat([
+            F.conv2d(x, self.weight_LL, bias=None, stride=2, groups=3),
+            F.conv2d(x, self.weight_LH, bias=None, stride=2, groups=3),
+            F.conv2d(x, self.weight_HL, bias=None, stride=2, groups=3),
+            F.conv2d(x, self.weight_HH, bias=None, stride=2, groups=3),
+        ], dim=1)  # (B, 12, H/2, W/2)
 
 
-class HaarUpsampling(nn.Module):
-    """Inverse Haar wavelet — reconstructs from 4 frequency bands.
-    Input: 12 channels → Output: 3 channels at 2x resolution
+# ═══════════════════════════════════════════════════════════════
+# FULL WDN MODEL — wrap everything into single forward()
+# This is what gets exported to ONNX
+# ═══════════════════════════════════════════════════════════════
+
+class FullWDNModel(nn.Module):
     """
-    def __init__(self):
-        super().__init__()
-        # Inverse filters
-        ll = torch.tensor([[1, 1], [1, 1]], dtype=torch.float32) / 2.0
-        lh = torch.tensor([[1, 1], [-1, -1]], dtype=torch.float32) / 2.0
-        hl = torch.tensor([[1, -1], [1, -1]], dtype=torch.float32) / 2.0
-        hh = torch.tensor([[1, -1], [-1, 1]], dtype=torch.float32) / 2.0
-
-        filters = torch.stack([ll, lh, hl, hh], dim=0).unsqueeze(1)
-        filters = filters.repeat(1, 3, 1, 1)
-        self.register_buffer('filters', filters.view(12, 1, 2, 2))
-        self.groups = 3
-
-    def forward(self, x):
-        # x: (B, 12, H, W) → (B, 3, H*2, W*2)
-        return F.conv_transpose2d(x, self.filters, stride=2, groups=self.groups)
-
-
-class ResBlock(nn.Module):
-    """Simple residual block with BN"""
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, 1, 1)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(channels, channels, 3, 1, 1)
-        self.bn2 = nn.BatchNorm2d(channels)
-
-    def forward(self, x):
-        return x + self.bn2(self.conv2(self.relu(self.bn1(self.conv1(x)))))
-
-
-class WDNWrapper(nn.Module):
-    """Full WDN pipeline: Wavelet → Denoise → SR → Reconstruct
-
-    This mirrors the inference logic in Real-ESRGAN's
-    RealESRGANer._postprocess() and _preprocess().
+    Complete WDN pipeline in one module:
+    x (B,3,H,W) → Haar_down → UNet denoise → SRVGG → output (B,3,H*4,W*4)
     """
-    def __init__(self, srvgg_model):
+
+    def __init__(self, srvgg, unet, haar):
         super().__init__()
-        self.srvgg = srvgg_model
-
-        # Wavelet decomposition / reconstruction
-        self.haar_down = HaarDownsampling()
-        self.haar_up = HaarUpsampling()
-
-        # Denoise network for wavelet coefficients
-        self.denoise = nn.Sequential(
-            nn.Conv2d(12, 64, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            ResBlock(64),
-            ResBlock(64),
-            ResBlock(64),
-            nn.Conv2d(64, 12, 3, 1, 1),
-        )
-
-    def forward(self, x):
-        # x: (B, 3, H, W)
-        B, C, H, W = x.shape
-
-        # ── Step 1: Wavelet decompose ──
-        coeffs = self.haar_down(x)  # (B, 12, H/2, W/2)
-
-        # ── Step 2: Denoise wavelet coefficients ──
-        denoised_coeffs = coeffs + self.denoise(coeffs)  # residual learning
-        # Ensure H/2, W/2 are even for SRVGG
-        denoised_coeffs = self.mod_pad(denoised_coeffs)
-
-        # ── Step 3: SR on wavelet coefficients (4x upscale) ──
-        sr_coeffs = self.srvgg(denoised_coeffs)  # (B, 12, H*2, W*2)
-
-        # ── Step 4: Reconstruct via inverse wavelet ──
-        output = self.haar_up(sr_coeffs)  # (B, 3, H*4, W*4)
-
-        # ── Step 5: Trim to exact 4x output ──
-        output = output[:, :, :H * self.srvgg.upscale, :W * self.srvgg.upscale]
-        return output
+        self.srvgg = srvgg
+        self.unet = unet
+        self.haar = haar
 
     @staticmethod
-    def mod_pad(x, modulo=2):
-        """Pad spatial dims to be divisible by modulo"""
+    def _mod2(x):
+        """Pad to even spatial dims"""
         _, _, h, w = x.shape
-        pad_h = (modulo - h % modulo) % modulo
-        pad_w = (modulo - w % modulo) % modulo
-        if pad_h > 0 or pad_w > 0:
+        pad_h = h % 2
+        pad_w = w % 2
+        if pad_h or pad_w:
             x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
-        return x
+        return x, pad_h, pad_w
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        # Step 1: Pad input to even dims for Haar
+        x_pad, pad_h, pad_w = self._mod2(x)
+
+        # Step 2: Wavelet decompose  → (B, 12, H/2, W/2)
+        coeffs = self.haar(x_pad)
+        h_half = coeffs.shape[2]
+        w_half = coeffs.shape[3]
+
+        # Step 3: UNet denoise in wavelet domain
+        coeffs_dn = self.unet(coeffs)
+
+        # Step 4: SRVGG 4x on wavelet coefficients
+        # Input: (B, 12, H/2, W/2) → Output: (B, 3, H*2, W*2)
+        # PixelShuffle 4x: 12→3, 2x spatial
+        sr_out = self.srvgg(coeffs_dn)  # (B, 3, H*2, W*2)
+
+        # Step 5: Trim to exact expected size
+        expected_h = (H + pad_h) * 2
+        expected_w = (W + pad_w) * 2
+        sr_out = sr_out[:, :, :expected_h, :expected_w]
+
+        return sr_out
 
 
 # ═══════════════════════════════════════════════════════════════
-# LOAD & CONVERT
+# LOAD STATE DICT — robust with auto-detection
 # ═══════════════════════════════════════════════════════════════
 
-def load_model(pth_path):
-    """Load .pth and reconstruct model with correct state_dict mapping"""
+def load_wdn_model(pth_path):
     print(f"Loading: {pth_path}")
+
     checkpoint = torch.load(pth_path, map_location='cpu', weights_only=False)
 
-    # Handle different checkpoint formats
+    # Extract state_dict
     if isinstance(checkpoint, dict):
-        if 'params_ema' in checkpoint:
-            state_dict = checkpoint['params_ema']
-        elif 'params' in checkpoint:
-            state_dict = checkpoint['params']
-        elif 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
+        for key in ['params_ema', 'params', 'state_dict']:
+            if key in checkpoint:
+                state_dict = checkpoint[key]
+                print(f"  Found state_dict under '{key}'")
+                break
         else:
             state_dict = checkpoint
     else:
         state_dict = checkpoint
 
-    # Detect prefix
+    # Strip prefix
     first_key = list(state_dict.keys())[0]
-    print(f"First key: {first_key}")
-
+    prefix = ''
     if first_key.startswith('module.'):
-        state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
-        print("Stripped 'module.' prefix")
+        prefix = 'module.'
+    elif first_key.startswith('net_g.'):
+        prefix = 'net_g.'
 
-    # Detect architecture from weights
-    has_denoise = any('denoise' in k for k in state_dict.keys())
-    has_wavelet = any('haar' in k for k in state_dict.keys())
+    if prefix:
+        state_dict = {k.replace(prefix, '', 1): v
+                      for k, v in state_dict.items()}
+        print(f"  Stripped prefix: '{prefix}'")
 
-    # Detect SRVGG params
-    if 'body.0.weight' in state_dict:
-        num_in_ch = state_dict['body.0.weight'].shape[1]  # 12 for WDN
-        num_feat = state_dict['body.0.weight'].shape[0]    # 64
+    # ── Detect SRVGG config ──
+    srvgg_state = {}
+    unet_state = {}
 
-        # Count conv layers
-        conv_indices = [int(k.split('.')[1])
-                        for k in state_dict.keys()
-                        if k.startswith('body.') and k.endswith('.weight')]
+    for k, v in state_dict.items():
+        if k.startswith('denoise.') or k.startswith('denoising.'):
+            clean_k = k.replace('denoising.', 'denoise.')
+            if clean_k.startswith('denoise.'):
+                unet_state[clean_k[len('denoise.'):]] = v
+        elif not k.startswith('haar_'):
+            srvgg_state[k] = v
 
-        # Last conv (PixelShuffle input) has shape (out_ch * scale^2, feat, 3, 3)
-        last_key = max(
-            [k for k in state_dict.keys() if k.startswith('body.')],
-            key=lambda k: int(k.split('.')[1]) if k.split('.')[1].isdigit() else 0
-        )
-        last_shape = state_dict[last_key].shape
-        num_out_ch = last_shape[0] // 16  # 4^2 = 16 for 4x
+    # Detect from weights
+    first_conv_key = 'body.0.weight'
+    if first_conv_key not in srvgg_state:
+        # Try with different prefixes
+        for k in srvgg_state:
+            if 'body.0.weight' in k:
+                first_conv_key = k
+                break
 
-        num_conv = (max(conv_indices) - 1) // 2  # first + (conv+act) pairs + last
+    num_in_ch = srvgg_state[first_conv_key].shape[1]   # 12 for WDN
+    num_feat = srvgg_state[first_conv_key].shape[0]     # 64
 
-        print(f"Detected SRVGG: in={num_in_ch}, out={num_out_ch}, "
-              f"feat={num_feat}, conv={num_conv}")
-    else:
-        # Fallback defaults
-        num_in_ch = 12
-        num_out_ch = 3
-        num_feat = 64
-        num_conv = 23
+    # Count conv layers
+    conv_ids = []
+    prelu_keys = []
+    for k in srvgg_state:
+        parts = k.split('.')
+        if len(parts) >= 3 and parts[0] == 'body':
+            idx = int(parts[1])
+            if parts[2] == 'weight' and len(srvgg_state[k].shape) == 4:
+                conv_ids.append(idx)
+            if parts[2] == 'weight' and len(srvgg_state[k].shape) == 1:
+                prelu_keys.append(idx)
 
-    # Build SRVGG
+    # Last conv is the biggest index
+    max_idx = max(conv_ids)
+    last_shape = srvgg_state[f'body.{max_idx}.weight'].shape
+    num_out_ch = last_shape[0] // 16  # PixelShuffle 4x → /4²
+
+    # num_conv = (max_idx - 1 - 1) / 2 → body: [0, 1_act, 2_conv, 3_act, ..., max, upsampler]
+    # indices: 0=first_conv, 1=first_act, 2..(max-1)=conv+act pairs, max=last_conv
+    num_conv = (max_idx - 2) // 2
+
+    print(f"  SRVGG: in={num_in_ch}, out={num_out_ch}, "
+          f"feat={num_feat}, conv={num_conv}")
+    print(f"  UNet weights: {len(unet_state)} tensors")
+
+    # ── Build models ──
     srvgg = SRVGGNetCompact(
         num_in_ch=num_in_ch,
         num_out_ch=num_out_ch,
@@ -269,167 +305,98 @@ def load_model(pth_path):
         upscale=4,
         act_type='prelu'
     )
+    srvgg.load_state_dict(srvgg_state, strict=True)
+    print(f"  SRVGG loaded ✓ ({sum(p.numel() for p in srvgg.parameters())} params)")
 
-    # Load SRVGG weights
-    srvgg_keys = {k: v for k, v in state_dict.items()
-                  if not k.startswith(('denoise.', 'haar_'))}
-    srvgg.load_state_dict(srvgg_keys, strict=True)
-    print(f"SRVGG loaded: {len(srvgg_keys)} tensors")
+    unet = UNet(in_nc=12, out_nc=12, nc=[64, 128, 256, 512])
+    if unet_state:
+        unet.load_state_dict(unet_state, strict=True)
+        print(f"  UNet loaded ✓ ({sum(p.numel() for p in unet.parameters())} params)")
+    else:
+        print("  WARNING: No UNet weights found, using random init")
 
-    # Build WDN wrapper
-    model = WDNWrapper(srvgg)
+    haar = WaveletHaarDownsampling()
 
-    # Load denoise weights if present
-    if has_denoise:
-        denoise_keys = {k: v for k, v in state_dict.items()
-                        if k.startswith('denoise.')}
-        try:
-            model.denoise.load_state_dict(denoise_keys, strict=False)
-            print(f"WDN denoise loaded: {len(denoise_keys)} tensors")
-        except Exception as e:
-            print(f"WDN denoise partial load: {e}")
-
-    if has_wavelet:
-        wavelet_keys = {k: v for k, v in state_dict.items()
-                        if k.startswith('haar_')}
-        print(f"Found {len(wavelet_keys)} wavelet keys (using fixed Haar filters)")
-
+    # ── Combine ──
+    model = FullWDNModel(srvgg, unet, haar)
     model.eval()
+
+    # Freeze all
+    for p in model.parameters():
+        p.requires_grad = False
+
     return model
 
 
-def export_onnx(model, onnx_path, input_size=64):
-    """Export to ONNX with fixed input shape for ncnn"""
-    print(f"\nExporting ONNX (input={input_size}x{input_size})...")
+# ═══════════════════════════════════════════════════════════════
+# EXPORT ONNX
+# ═══════════════════════════════════════════════════════════════
+
+def export_onnx(model, output_path, input_size=64):
+    print(f"\nExporting ONNX (input=1x3x{input_size}x{input_size})...")
 
     dummy = torch.randn(1, 3, input_size, input_size)
 
     # Verify forward pass
     with torch.no_grad():
         out = model(dummy)
-    print(f"Verification: input {list(dummy.shape)} → output {list(out.shape)}")
-    expected = input_size * 4
-    assert out.shape[2] == expected and out.shape[3] == expected, \
-        f"Expected {expected}x{expected}, got {out.shape[2]}x{out.shape[3]}"
+    print(f"  Verification: {list(dummy.shape)} → {list(out.shape)}")
+    print(f"  Expected: [1, 3, {input_size*2}, {input_size*2}]")
 
     torch.onnx.export(
         model,
         dummy,
-        onnx_path,
+        output_path,
         opset_version=11,
         input_names=['in0'],
         output_names=['out0'],
-        dynamic_axes=None,  # Fixed shape for ncnn
+        dynamic_axes=None,
+        do_constant_folding=True,
     )
-    print(f"Saved: {onnx_path} ({os.path.getsize(onnx_path) / 1e6:.1f} MB)")
 
-    # Simplify with onnxsim
+    size_mb = os.path.getsize(output_path) / 1e6
+    print(f"  Saved: {output_path} ({size_mb:.1f} MB)")
+
+    # ── Simplify with onnxsim ──
+    sim_path = output_path.replace('.onnx', '.sim.onnx')
     try:
         import onnx
         from onnxsim import simplify
 
-        print("Simplifying ONNX graph...")
-        onnx_model = onnx.load(onnx_path)
-        model_sim, ok = simplify(onnx_model)
+        print("  Simplifying with onnxsim...")
+        onnx_model = onnx.load(output_path)
+        model_sim, ok = simplify(
+            onnx_model,
+            input_shapes={'in0': [1, 3, input_size, input_size]}
+        )
         if ok:
-            onnx.save(model_sim, onnx_path.replace('.onnx', '.sim.onnx'))
-            print(f"Simplified: {onnx_path.replace('.onnx', '.sim.onnx')}")
-            return onnx_path.replace('.onnx', '.sim.onnx')
+            onnx.save(model_sim, sim_path)
+            print(f"  Simplified: {sim_path} ({os.path.getsize(sim_path)/1e6:.1f} MB)")
+            return sim_path
         else:
-            print("onnxsim failed, using original")
+            print("  onnxsim returned False, using original")
     except ImportError:
-        print("onnxsim not installed (pip install onnxsim), skipping simplify")
+        print("  onnxsim not installed, skipping")
 
-    return onnx_path
+    return output_path
 
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Convert realesr-general-wdn-x4v3.pth → ncnn')
-    parser.add_argument('--input', type=str, required=True,
-                        help='Path to realesr-general-wdn-x4v3.pth')
-    parser.add_argument('--output', type=str, default=None,
-                        help='Output directory (default: same as input)')
-    parser.add_argument('--input-size', type=int, default=64,
-                        help='ONNX input size (default: 64)')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input', required=True, help='.pth file path')
+    parser.add_argument('--output', required=True, help='.onnx output path')
+    parser.add_argument('--input-size', type=int, default=64)
     args = parser.parse_args()
 
-    if not os.path.exists(args.input):
-        print(f"Error: {args.input} not found")
-        sys.exit(1)
+    model = load_wdn_model(args.input)
+    onnx_path = export_onnx(model, args.output, args.input_size)
 
-    out_dir = args.output or os.path.dirname(os.path.abspath(args.input))
-    os.makedirs(out_dir, exist_ok=True)
-
-    basename = 'realesr-general-wdn-x4v3'
-
-    # ── Step 1: Load model ──
-    model = load_model(args.input)
-
-    # ── Step 2: Export ONNX ──
-    onnx_path = os.path.join(out_dir, f'{basename}.onnx')
-    final_onnx = export_onnx(model, onnx_path, args.input_size)
-
-    # ── Step 3: Print ncnn conversion commands ──
-    param_path = os.path.join(out_dir, f'{basename}.param')
-    bin_path = os.path.join(out_dir, f'{basename}.bin')
-    opt_param = os.path.join(out_dir, f'{basename}-opt.param')
-    opt_bin = os.path.join(out_dir, f'{basename}-opt.bin')
-
-    print("\n" + "=" * 60)
-    print("ONNX exported. Now run ncnn tools manually:")
-    print("=" * 60)
-    print()
-    print(f"# Step 3a: ONNX → ncnn")
-    print(f"onnx2ncnn {final_onnx} {param_path} {bin_path}")
-    print()
-    print(f"# Step 3b: Optimize (optional but recommended)")
-    print(f"ncnnoptimize {param_path} {bin_path} {opt_param} {opt_bin} 65536")
-    print()
-    print(f"# Step 3c: Verify with ncnn python wrapper")
-    print(f"import ncnn")
-    print(f"net = ncnn.Net()")
-    print(f"net.load_param('{opt_param or param_path}')")
-    print(f"net.load_model('{opt_bin or bin_path}')")
-    print()
-
-    # ── Step 4: Try automatic conversion if tools available ──
-    print("Attempting automatic ncnn conversion...")
-
-    onnx2ncnn = shutil.which('onnx2ncnn')
-    ncnnoptimize = shutil.which('ncnnoptimize')
-
-    if onnx2ncnn:
-        import subprocess
-        ret = subprocess.run([onnx2ncnn, final_onnx, param_path, bin_path],
-                             capture_output=True, text=True)
-        if ret.returncode == 0:
-            print(f"✓ onnx2ncnn: {param_path}, {bin_path}")
-
-            if ncnnoptimize:
-                ret = subprocess.run(
-                    [ncnnoptimize, param_path, bin_path,
-                     opt_param, opt_bin, '65536'],
-                    capture_output=True, text=True)
-                if ret.returncode == 0:
-                    print(f"✓ ncnnoptimize: {opt_param}, {opt_bin}")
-                else:
-                    print(f"✗ ncnnoptimize failed: {ret.stderr}")
-        else:
-            print(f"✗ onnx2ncnn failed: {ret.stderr}")
-            print("  Install ncnn tools: https://github.com/Tencent/ncnn/wiki/how-to-build")
-    else:
-        print("✗ onnx2ncnn not found in PATH")
-        print("  Install ncnn tools or build from source:")
-        print("  https://github.com/Tencent/ncnn/wiki/how-to-build")
-        print()
-        print("  Quick install on Linux/Mac:")
-        print("  brew install ncnn          # macOS")
-        print("  sudo apt install libncnn-dev # Ubuntu")
-
-    print("\n" + "=" * 60)
-    print("Done! Use .param + .bin in your Android app")
-    print("=" * 60)
+    print(f"\n✓ ONNX saved: {onnx_path}")
+    print("Next step: onnx2ncnn + ncnnoptimize (handled by GitHub Actions)")
 
 
 if __name__ == '__main__':
