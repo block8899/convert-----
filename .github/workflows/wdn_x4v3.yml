@@ -1,18 +1,16 @@
-name: Convert WDN → ncnn
+name: Convert WDN → ncnn (PNNX)
 
 on:
-  workflow_dispatch:    # Chạy tay từ GitHub UI
+  workflow_dispatch:
 
 jobs:
   convert:
     runs-on: ubuntu-latest
 
     steps:
-      # ── Checkout repo (nơi chứa script convert) ──
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── Setup Python + cài dependencies ──
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -22,10 +20,9 @@ jobs:
         run: |
           pip install torch==2.1.0+cpu \
                       --index-url https://download.pytorch.org/whl/cpu
-          pip install onnx==1.15.0 onnxsim==0.4.35 onnxruntime==1.16.3
-          pip install opencv-python-headless numpy
+          pip install torchvision==0.16.0+cpu \
+                      --index-url https://download.pytorch.org/whl/cpu
 
-      # ── Download model ──
       - name: Download model
         run: |
           mkdir -p models
@@ -34,71 +31,56 @@ jobs:
             -O models/realesr-general-wdn-x4v3.pth
           ls -lh models/
 
-      # ── Install ncnn tools ──
-      - name: Install ncnn tools
+      - name: Download PNNX
         run: |
-          # Build ncnn from source (chỉ cần onnx2ncnn + ncnnoptimize)
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake libprotobuf-dev protobuf-compiler libvulkan-dev glslang-tools
+          # PNNX pre-built binary — không cần build ncnn
+          wget -q \
+            "https://github.com/pnnx/pnnx/releases/download/20240410/pnnx-20240410-ubuntu.zip" \
+            -O pnnx.zip
+          unzip -q pnnx.zip -d pnnx-tool
+          chmod +x pnnx-tool/pnnx/pnnx
+          ls -la pnnx-tool/pnnx/
 
-          git clone --depth 1 https://github.com/Tencent/ncnn.git ncnn-src
-          cd ncnn-src
-          mkdir -p build && cd build
-          cmake -DNCNN_VULKAN=OFF -DNCNN_BUILD_EXAMPLES=OFF -DNCNN_BUILD_TOOLS=ON ..
-          make -j$(nproc) onnx2ncnn ncnnoptimize
-
-          # Copy tools ra nơi dễ dùng
-          cp tools/onnx2ncnn/onnx2ncnn $GITHUB_WORKSPACE/
-          cp tools/ncnnoptimize/ncnnoptimize $GITHUB_WORKSPACE/
-          chmod +x $GITHUB_WORKSPACE/onnx2ncnn $GITHUB_WORKSPACE/ncnnoptimize
-
-          echo "ncnn tools built OK"
-
-      # ── Step 1: PyTorch → ONNX ──
-      - name: Convert PyTorch → ONNX
-        working-directory: models    # ← THƯ MỤC CHẠY SCRIPT
+      - name: Generate torchscript and run PNNX
+        working-directory: models
         run: |
-          python $GITHUB_WORKSPACE/scripts/convert_wdn_to_onnx.py \
+          python $GITHUB_WORKSPACE/scripts/export_wdn_pnnx.py \
             --input realesr-general-wdn-x4v3.pth \
-            --output realesr-general-wdn-x4v3.onnx \
-            --input-size 64
-          ls -lh *.onnx
+            --output-dir $GITHUB_WORKSPACE/models
 
-      # ── Step 2: ONNX → ncnn ──
-      - name: Convert ONNX → ncnn
+      - name: Run PNNX converter
         working-directory: models
         run: |
-          $GITHUB_WORKSPACE/onnx2ncnn \
-            realesr-general-wdn-x4v3.onnx \
-            realesr-general-wdn-x4v3.param \
-            realesr-general-wdn-x4v3.bin
+          $GITHUB_WORKSPACE/pnnx-tool/pnnx/pnnx \
+            wdn_script.pt \
+            inputshape="[1,3,64,64]"
 
-          echo "=== Optimize ==="
-          $GITHUB_WORKSPACE/ncnnoptimize \
-            realesr-general-wdn-x4v3.param \
-            realesr-general-wdn-x4v3.bin \
-            realesr-general-wdn-x4v3-opt.param \
-            realesr-general-wdn-x4v3-opt.bin \
-            65536
+          echo "=== Output files ==="
+          ls -lh *.param *.bin 2>/dev/null || echo "No ncnn files found"
+          ls -lh wdn_script* 2>/dev/null
 
-          echo "=== Output ==="
-          ls -lh *.param *.bin
-
-      # ── Verify ncnn model ──
-      - name: Verify ncnn model
+      - name: Rename output
         working-directory: models
         run: |
-          head -5 realesr-general-wdn-x4v3-opt.param
-          echo "---"
-          grep -c "Convolution" realesr-general-wdn-x4v3-opt.param
-          echo "convolution layers found"
+          # PNNX output: wdn_script.ncnn.param / .bin
+          if [ -f "wdn_script.ncnn.param" ]; then
+            cp wdn_script.ncnn.param realesr-general-wdn-x4v3.param
+            cp wdn_script.ncnn.bin realesr-general-wdn-x4v3.bin
+            echo "=== Verify ==="
+            head -5 realesr-general-wdn-x4v3.param
+            echo "---"
+            wc -l realesr-general-wdn-x4v3.param
+          else
+            echo "ERROR: ncnn output not found"
+            ls -la
+            exit 1
+          fi
 
-      # ── Upload artifacts ──
       - name: Upload ncnn model
         uses: actions/upload-artifact@v4
         with:
           name: wdn-x4v3-ncnn
           path: |
-            models/realesr-general-wdn-x4v3-opt.param
-            models/realesr-general-wdn-x4v3-opt.bin
+            models/realesr-general-wdn-x4v3.param
+            models/realesr-general-wdn-x4v3.bin
           retention-days: 30
